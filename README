@@ -7,15 +7,29 @@
 7. install your package
 8. run your Claude Desktop
 
-chmod +x build-claude-desktop.sh
+```chmod +x build-claude-desktop.sh
 ./build-claude-desktop.sh
 sudo dpkg -i claude-desktop_*.deb
 sudo apt-get install -f
 claude-desktop
+```
 
 If you encounter problem, interact with Claude, in order to solve it
 Keep me informed of problems with a comment at
 https://www.linkedin.com/posts/vincenzo-caselli_ugcPost-7452501572623712256-NxH1?utm_source=share&utm_medium=member_desktop&rcm=ACoAAAEd7dkB5lZQ8ueQpuWRxNcpsjN6o2k6zzE
+
+In case of freeze/hung:
+# kill all Claude Desktop processes
+pkill -f claude-desktop
+pkill -f electron
+
+# Remove lock file
+rm -f ~/.config/Claude/IndexedDB/https_claude.ai_0.indexeddb.leveldb/LOCK
+
+# Re-launch
+claude-desktop
+
+
 
 
 How to verify Claude Desktop latest version
