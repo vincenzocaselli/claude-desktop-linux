@@ -1,0 +1,2 @@
+How to verify Claude Desktop latest version
+curl -sL "https://downloads.claude.ai/releases/win32/x64/RELEASES"
