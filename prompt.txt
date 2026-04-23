@@ -1,0 +1,65 @@
+Scrivimi uno script bash che costruisca un pacchetto .deb di Claude Desktop per Ubuntu/ZorinOS/Mint partendo dai file ufficiali di Anthropic, senza dipendere da repo terzi.
+
+Lo script deve:
+
+1. Rilevare l'ultima versione leggendo
+   https://downloads.claude.ai/releases/win32/x64/RELEASES
+   (formato Squirrel: "SHA1  AnthropicClaude-VERSION-full.nupkg  size", prendere l'ultima riga "-full.nupkg") e scaricare il .nupkg da
+   https://downloads.claude.ai/releases/win32/x64/<nome-nupkg>
+   con curl -L (gestisce redirect HTTP/2). Verifica magic bytes ZIP
+   (504b0304) con head -c 4 | od -A n -t x1, NON xxd.
+
+2. Cache permanente in claude-build-cache/ con cached-version.txt
+   (newline finale). Workdir temporanea claude-build-tmp/.
+
+3. Estrarre il .nupkg con 7z, trovare app.asar e i file resources/i18n. Estrarre l'asar con @electron/asar (installato localmente via npm).
+
+4. Sostituire @ant/claude-native (modulo nativo Windows) con uno stub JS che esporta:
+   - KeyboardKey enum completo (A-Z, 0-9, F1-F12, frecce, modificatori)
+   - AuthRequest.isAvailable() → false (per fallback OAuth via browser)
+   - Tutte le altre funzioni come no-op che ritornano valori neutri
+   - getResourcesPath() → '/usr/lib/claude-desktop'
+
+5. Iniettare frame-fix-wrapper.js che intercetta require('electron') con un Proxy (NON defineProperty: fallisce su proprietà non-configurable) e patcha BrowserWindow E BaseWindow forzando frame:true, titleBarStyle:'default', autoHideMenuBar:false. Listener
+   app.on('browser-window-created') che riapplica setMenuBarVisibility alle finestre create.
+
+6. Iniettare update-checker.js che dopo app.whenReady():
+   - Polling ogni ora di RELEASES per rilevare nuove versioni
+   - Notifica nativa Electron con dialog "Aggiorna ora / Più tardi"
+   - "Aggiorna ora" → spawn /usr/bin/claude-update --upgrade
+   - Se endpoint rotto: notifica con "Apri diagnostica" che apre
+     claude.ai/new?q=<prompt URL-encoded di troubleshooting>
+   - Tray icon nell'area di sistema con menu contestuale:
+     "Claude Desktop vX.Y.Z" (disabled), "Mostra/Nascondi finestra",
+     "Verifica aggiornamenti" (forza check immediato), "Info versione e aggiornamenti…" (apre dialog completo), "Esci"
+   - Per nascondere il menu File/Edit/View/Help di Electron: nascondere la finestra alla creazione (browser-window-created), polling permanente ogni 200ms di Menu.setApplicationMenu(null) +
+     win.setMenu(null) per ogni BrowserWindow.getAllWindows(), mostrare finestra dopo 5 secondi.
+
+7. Copiare i file resources/i18n DENTRO l'asar (l'app li cerca dentro, non fuori). Se nessun file i18n trovato, creare en-US.json minimale.
+
+8. Iniettare frame-fix-entry.js che fa require('./frame-fix-wrapper'),
+   require('./update-checker'), require('./.vite/build/index.js').
+   Modificare package.json: main → "./frame-fix-entry.js".
+
+9. Repack via @electron/asar pack.
+
+10. Installare Electron localmente nel pacchetto via npm install
+    --prefix. chmod 4755 su chrome-sandbox.
+
+11. Costruire struttura .deb standard:
+    /usr/lib/claude-desktop/{app.asar, app.asar.unpacked, resources/,
+    electron-dist/, .installed-version}
+    /usr/bin/claude-desktop (launcher con --app-path)
+    /usr/bin/claude-update (script bash con --upgrade, --diagnose,
+    --status; --upgrade scarica nupkg, ri-applica le patch sopra,
+    sostituisce app.asar via pkexec)
+    /usr/share/applications/claude-desktop.desktop
+    /usr/share/icons/hicolor/{16,24,32,48,64,128,256}x{...}/apps/claude.png estratte da .exe nel nupkg con wrestool + icotool
+
+12. Dependencies del .deb: libnss3, libatk-bridge2.0-0, libdrm2,
+    libxkbcommon0, libgbm1, libasound2|libasound2t64, libgtk-3-0,
+    curl, p7zip-full, policykit-1, nodejs.
+    Recommends: zenity, xdg-utils.
+
+Costruisci il pacchetto come claude-desktop_<versione>_amd64.deb.
+Niente systemd, niente daemon esterni: tutto in-app. 
