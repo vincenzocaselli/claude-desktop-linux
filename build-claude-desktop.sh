@@ -519,6 +519,57 @@ cat > "${WORKDIR}/app-extracted/frame-fix-wrapper.js" << 'FRAMEWRAP'
 const Module = require('module');
 const originalLoad = Module._load;
 
+// Legge la versione effettiva dell'app dal package.json dentro l'asar.
+// Questa è la "verità assoluta" — sempre allineata con l'app realmente
+// in esecuzione, anche dopo upgrade in-place che bypassano dpkg.
+let _appVersion = null;
+function getAppVersion() {
+  if (_appVersion !== null) return _appVersion;
+  try {
+    const pkg = require('./package.json');
+    _appVersion = pkg.version || '';
+  } catch (e) {
+    _appVersion = '';
+  }
+  return _appVersion;
+}
+
+// Applica il suffisso versione al titolo della finestra.
+// Aggiunge " — vX.Y.Z" se non è già presente.
+// Riapplica automaticamente quando l'app cambia il titolo.
+function applyVersionToTitle(win) {
+  if (!win || typeof win.getTitle !== 'function') return;
+  const version = getAppVersion();
+  if (!version) return;
+  const suffix = ' — v' + version;
+
+  const updateTitle = () => {
+    try {
+      const current = win.getTitle();
+      if (current && !current.endsWith(suffix)) {
+        // Rimuovi vecchio suffisso se presente (versione diversa) e aggiungi nuovo
+        const cleaned = current.replace(/ — v\d+\.\d+\.\d+$/, '');
+        win.setTitle(cleaned + suffix);
+      }
+    } catch (e) {}
+  };
+
+  updateTitle();
+  // Ascolta i cambi di titolo dell'app per riapplicare il suffisso
+  try {
+    win.on('page-title-updated', (event) => {
+      // Lascia che l'app aggiorni il titolo, poi riapplica
+      setTimeout(updateTitle, 0);
+    });
+  } catch (e) {}
+  // Re-check periodico per i primi 30 secondi (titoli impostati tardivamente)
+  let attempts = 0;
+  const interval = setInterval(() => {
+    updateTitle();
+    if (++attempts >= 30) clearInterval(interval);
+  }, 1000);
+}
+
 function applyVisibilityFixes(win, source) {
   if (!win) return;
   try {
@@ -528,6 +579,8 @@ function applyVisibilityFixes(win, source) {
     if (typeof win.setAutoHideMenuBar === 'function') {
       win.setAutoHideMenuBar(false);
     }
+    // Aggiunge versione al titolo finestra
+    applyVersionToTitle(win);
     console.log('[frame-fix] fixes applicati a finestra via', source || '?',
       '- title:', win.getTitle ? win.getTitle() : '(n/a)');
   } catch (e) {
@@ -665,7 +718,7 @@ const path = require('path');
 
 const RELEASES_URL = 'https://downloads.claude.ai/releases/win32/x64/RELEASES';
 const CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 ora
-const FIRST_CHECK_DELAY_MS = 2 * 60 * 1000; // 2 minuti dopo l'avvio
+const FIRST_CHECK_DELAY_MS = 5 * 1000; // 5 secondi dopo l'avvio (check iniziale)
 const INSTALLED_VERSION_PATH = '/usr/lib/claude-desktop/.installed-version';
 const LOG_PREFIX = '[update-checker]';
 
@@ -1447,7 +1500,16 @@ mkdir -p "${UPDATE_DIR}"
 
 # ── Funzioni di utilità ───────────────────────────────────────────────────
 installed_version() {
-    dpkg-query -W -f='${Version}' claude-desktop 2>/dev/null || echo "sconosciuta"
+    # Source of truth: il file .installed-version aggiornato sia dal build
+    # che da claude-update --upgrade. Riflette la versione effettivamente
+    # presente nell'app.asar, anche se dpkg/apt non ne sono a conoscenza
+    # (gli upgrade in-place bypassano il package manager).
+    if [[ -f /usr/lib/claude-desktop/.installed-version ]]; then
+        cat /usr/lib/claude-desktop/.installed-version | tr -d '\r\n '
+    else
+        # Fallback: vecchia logica via dpkg
+        dpkg-query -W -f='${Version}' claude-desktop 2>/dev/null || echo "sconosciuta"
+    fi
 }
 
 latest_version() {
@@ -1590,7 +1652,10 @@ do_inplace_upgrade() {
     # Ricompatta
     "${asar_tool}" pack "${extracted}" "${staging}/app-patched.asar" || return 1
 
-    # Copia in /usr/lib/claude-desktop (richiede privilegi)
+    # Copia in /usr/lib/claude-desktop (richiede privilegi).
+    # Aggiorniamo anche .installed-version: è il file letto dall'update-checker
+    # in-app per sapere qual è la versione corrente. Senza questo, l'app
+    # continuerebbe a vedere la vecchia versione e notificare ogni ora.
     local target="/usr/lib/claude-desktop"
     local resources_src="${staging}/extract"
     local resources_dir
@@ -1602,7 +1667,8 @@ do_inplace_upgrade() {
             if [[ -d '${resources_dir}' ]]; then
                 rm -rf '${target}/resources'
                 cp -r '${resources_dir}' '${target}/resources'
-            fi
+            fi && \
+            printf '%s\n' '${new_version}' > '${target}/.installed-version'
         " || return 1
     else
         # Fallback: chiedi sudo via zenity
@@ -1613,7 +1679,8 @@ do_inplace_upgrade() {
             if [[ -d '${resources_dir}' ]]; then
                 rm -rf '${target}/resources'
                 cp -r '${resources_dir}' '${target}/resources'
-            fi
+            fi && \
+            printf '%s\n' '${new_version}' > '${target}/.installed-version'
         " || return 1
     fi
 
