@@ -1577,30 +1577,58 @@ cmd_upgrade() {
 
     nupkg_file="${UPDATE_DIR}/AnthropicClaude-${latest_ver}-full.nupkg"
 
-    # Download con progress bar grafica (zenity) o testuale
+    # Rimuovi eventuale file parziale da run precedente (anche per evitare
+    # che il check di dimensione passi su un file di 1 byte)
+    rm -f "${nupkg_file}"
+
+    # Download. Il flusso curl|tr|sed|zenity in pipe ha causato problemi in
+    # passato (curl killato da SIGPIPE quando zenity termina, lasciando
+    # nupkg parziale). Strategia più robusta: scarichiamo prima, poi
+    # eventualmente mostriamo zenity per UX, ma se zenity fallisce non
+    # blocchiamo. Il vero feedback di download è il file finale.
     if command -v zenity >/dev/null 2>&1; then
-        ( curl -L --progress-bar -o "${nupkg_file}" "${latest_url}" 2>&1 \
-            | tr '\r' '\n' \
-            | sed -u 's/[^0-9]*\([0-9]*\).*/\1/' ) \
-            | zenity --progress --auto-close --no-cancel \
-                --title="Aggiornamento Claude Desktop" \
-                --text="Download versione ${latest_ver} in corso..." 2>/dev/null \
-            || curl -L --progress-bar -o "${nupkg_file}" "${latest_url}"
+        # Pulse mode (animazione indeterminata) finché curl finisce.
+        # Più affidabile della progress bar coi byte (richiederebbe
+        # parsing curl che non sempre funziona).
+        (
+            curl -L --silent --show-error --max-time 600 \
+                -o "${nupkg_file}" "${latest_url}" 2>/tmp/claude-upgrade-curl.err
+            echo "100"
+        ) | zenity --progress --pulsate --auto-close --no-cancel \
+            --title="Aggiornamento Claude Desktop" \
+            --text="Download versione ${latest_ver} in corso..." 2>/dev/null || true
     else
-        curl -L --progress-bar -o "${nupkg_file}" "${latest_url}"
+        curl -L --progress-bar --max-time 600 \
+            -o "${nupkg_file}" "${latest_url}" \
+            || die_gui "Download fallito (curl). Verifica connessione."
     fi
 
-    [[ -f "${nupkg_file}" ]] || die_gui "Download fallito"
+    # Verifica esistenza
+    [[ -f "${nupkg_file}" ]] || die_gui \
+        "Download fallito: file non creato. Verifica connessione internet."
 
-    # Verifica magic bytes ZIP
+    # Verifica dimensione minima (un nupkg vero pesa >100MB; <10MB = parziale)
+    local nupkg_size
+    nupkg_size=$(stat -c%s "${nupkg_file}" 2>/dev/null || echo 0)
+    if [[ "${nupkg_size}" -lt 10000000 ]]; then
+        local errmsg=""
+        [[ -s /tmp/claude-upgrade-curl.err ]] \
+            && errmsg=" Dettaglio: $(cat /tmp/claude-upgrade-curl.err)"
+        rm -f "${nupkg_file}"
+        die_gui "Download incompleto (${nupkg_size} bytes, atteso >10MB).${errmsg}"
+    fi
+
+    # Verifica magic bytes ZIP (PK\x03\x04)
     local magic
     magic=$(head -c 4 "${nupkg_file}" | od -A n -t x1 | tr -d ' \n')
-    [[ "${magic}" == "504b0304" ]] || die_gui "File scaricato non valido"
+    if [[ "${magic}" != "504b0304" ]]; then
+        rm -f "${nupkg_file}"
+        die_gui "File scaricato non è un NuGet valido (magic: ${magic})."
+    fi
 
-    # Ricostruisci e installa. Usiamo lo script di build se presente.
-    # In alternativa, aggiorniamo in-place i soli file modificati (app.asar + resources)
+    # Ricostruisci e installa
     do_inplace_upgrade "${nupkg_file}" "${latest_ver}" \
-        || die_gui "Aggiornamento fallito. Esegui lo script di build manualmente."
+        || die_gui "Patch e install fallita. Vedi: bash -x /usr/bin/claude-update --upgrade"
 
     # Successo: notifica riavvio
     if command -v zenity >/dev/null 2>&1; then
@@ -1827,9 +1855,36 @@ die_gui() {
 }
 
 restart_claude() {
-    pkill -x claude-desktop 2>/dev/null
-    sleep 1
-    nohup /usr/bin/claude-desktop >/dev/null 2>&1 &
+    # Il processo Claude Desktop è in realtà 'electron' (non 'claude-desktop'),
+    # quindi 'pkill -x claude-desktop' non trova nulla. Identifichiamo i
+    # processi via pattern sul comando completo: electron + path dell'app.asar.
+    # Killiamo prima il processo padre, poi forziamo terminazione di eventuali
+    # zombie con SIGKILL, attendiamo che siano davvero morti, poi riavviamo.
+    local pids
+    pids=$(pgrep -f "electron.*claude-desktop" 2>/dev/null)
+    if [[ -n "${pids}" ]]; then
+        # SIGTERM: kill gentile, lascia all'app la chance di chiudere pulito
+        kill ${pids} 2>/dev/null || true
+        # Aspetta fino a 5 secondi che muoia
+        for i in 1 2 3 4 5; do
+            sleep 1
+            pids=$(pgrep -f "electron.*claude-desktop" 2>/dev/null)
+            [[ -z "${pids}" ]] && break
+        done
+        # Se sopravvive, SIGKILL
+        if [[ -n "${pids}" ]]; then
+            kill -9 ${pids} 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+    # Lancia la nuova istanza in modo veramente staccato (setsid)
+    # così non viene killata se claude-update termina.
+    if command -v setsid >/dev/null 2>&1; then
+        setsid /usr/bin/claude-desktop >/dev/null 2>&1 < /dev/null &
+    else
+        nohup /usr/bin/claude-desktop >/dev/null 2>&1 < /dev/null &
+    fi
+    disown 2>/dev/null || true
 }
 
 # ── Main dispatcher ───────────────────────────────────────────────────────
