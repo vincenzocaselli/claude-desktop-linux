@@ -1,5 +1,5 @@
-
 # How to build your own Linux Claude Desktop
+
 1. open chat claude.ai (better to use Pro, Max or Team)
 2. copy/paste prompt.txt content
 3. Claude will generate your script build-claude-desktop.sh (my version is included in this repo, just in case: you should generate your own)
@@ -9,10 +9,22 @@
 7. install your package
 8. run your Claude Desktop
 
-```chmod +x build-claude-desktop.sh
+## Debian / Ubuntu / ZorinOS / Linux Mint
+
+```
+chmod +x build-claude-desktop.sh
 ./build-claude-desktop.sh
 sudo dpkg -i claude-desktop_*.deb
 sudo apt-get install -f
+claude-desktop
+```
+
+## Arch Linux / Manjaro / EndeavourOS
+
+```
+chmod +x build-claude-desktop-arch.sh
+./build-claude-desktop-arch.sh
+sudo pacman -U claude-desktop-*.pkg.tar.zst
 claude-desktop
 ```
 
