@@ -96,9 +96,13 @@ fi
 ok "Tutte le dipendenze di sistema presenti"
 
 # Installa @electron/asar localmente (non globalmente, per non sporcare il sistema)
-info "Installazione @electron/asar locale..."
-npm install --prefix "${WORKDIR}/npm-tools" @electron/asar 2>/dev/null \
-    || die "Installazione @electron/asar fallita"
+# Pin a versione compatibile con Node 18: la latest richiede Node 22+ e usa
+# sintassi "import with {type:'json'}" non supportata. @electron/asar@3.2.x è
+# l'ultima serie compatibile con Node 18+. Fallback su 'asar' deprecato (Node 10+).
+info "Installazione @electron/asar locale (versione compatibile Node 18+)..."
+npm install --prefix "${WORKDIR}/npm-tools" '@electron/asar@~3.2.0' 2>/dev/null \
+    || npm install --prefix "${WORKDIR}/npm-tools" 'asar@~3.2.0' 2>/dev/null \
+    || die "Installazione asar fallita"
 ASAR="${WORKDIR}/npm-tools/node_modules/.bin/asar"
 [[ -x "${ASAR}" ]] || die "asar non trovato dopo installazione npm"
 ok "@electron/asar installato in ${WORKDIR}/npm-tools"
@@ -1666,8 +1670,13 @@ do_inplace_upgrade() {
     asar_tool=$(command -v asar 2>/dev/null \
         || find /usr/lib/claude-desktop -name "asar" -type f 2>/dev/null | head -1)
     if [[ -z "${asar_tool}" ]]; then
-        # Installa asar temporaneamente
-        npm install --prefix "${staging}/npm-tools" @electron/asar >/dev/null 2>&1 || return 1
+        # Pin a versione compatibile con Node 18 (Anthropic's @electron/asar latest
+        # richiede Node 22+ e usa "import with {type:'json'}" non supportato).
+        # @electron/asar@3.2.x è l'ultima serie che gira su Node 18.
+        # Fallback: pacchetto deprecato 'asar' (richiede solo Node 10+).
+        npm install --prefix "${staging}/npm-tools" '@electron/asar@~3.2.0' >/dev/null 2>&1 \
+            || npm install --prefix "${staging}/npm-tools" 'asar@~3.2.0' >/dev/null 2>&1 \
+            || return 1
         asar_tool="${staging}/npm-tools/node_modules/.bin/asar"
     fi
 
@@ -1738,18 +1747,313 @@ const AuthRequest={isAvailable:()=>false,start:(_u,cb)=>cb&&cb(null,new Error('N
 module.exports={KeyboardKey,AuthRequest,getWindowsWithSameApp:()=>[],getMonitorList:()=>[],getMouseLocation:()=>({x:0,y:0}),getTotalMemory:()=>4*1024*1024*1024,getWindowTitle:()=>'',moveMouseTo:()=>{},simulateKey:()=>{},screenCapture:()=>null,setGlobalShortcut:()=>true,unsetGlobalShortcut:()=>{},getSystemTheme:()=>'dark',onWindowFocusChanged:()=>{},getResourcesPath:()=>'/usr/lib/claude-desktop'};
 STUB
 
-    # 2. Frame fix
+    # 2. Frame fix wrapper (versione completa: BrowserWindow + BaseWindow,
+    #    suffisso versione nel titolo, listener browser-window-created)
     cat > "${extracted}/frame-fix-wrapper.js" <<'WRAP'
 'use strict';
 const Module=require('module');const orig=Module._load;
+let _v=null;
+function getV(){if(_v!==null)return _v;try{_v=require('./package.json').version||'';}catch(e){_v='';}return _v;}
+function applyTitle(w){if(!w||!w.getTitle)return;const v=getV();if(!v)return;const s=' — v'+v;
+const upd=()=>{try{const c=w.getTitle();if(c&&!c.endsWith(s))w.setTitle(c.replace(/ — v\d+\.\d+\.\d+$/,'')+s);}catch(e){}};
+upd();try{w.on('page-title-updated',()=>setTimeout(upd,0));}catch(e){}
+let n=0;const i=setInterval(()=>{upd();if(++n>=30)clearInterval(i);},1000);}
+function applyFix(w){if(!w)return;try{w.setMenuBarVisibility&&w.setMenuBarVisibility(true);w.setAutoHideMenuBar&&w.setAutoHideMenuBar(false);applyTitle(w);}catch(e){}}
 Module._load=function(req,parent,isMain){const r=orig.apply(this,arguments);
-if(req==='electron'&&r&&r.BrowserWindow){const O=r.BrowserWindow;
-class P extends O{constructor(o={}){if(o.frame===undefined)o=Object.assign({},o,{frame:true});super(o);}}
-Object.assign(P,O);try{Object.defineProperty(r,'BrowserWindow',{value:P,writable:true,configurable:true});}catch(e){}}
+if(req==='electron'&&r&&!r.__ff){['BrowserWindow','BaseWindow'].forEach(c=>{if(r[c]){const O=r[c];
+class P extends O{constructor(o={}){const po=Object.assign({},o,{frame:true,titleBarStyle:'default',autoHideMenuBar:false});delete po.titleBarOverlay;super(po);applyFix(this);}}
+Object.getOwnPropertyNames(O).forEach(p=>{if(!['length','name','prototype'].includes(p)){try{P[p]=O[p];}catch(e){}}});
+try{Object.defineProperty(r,c,{value:P,writable:true,configurable:true});}catch(e){}}});
+if(r.app&&r.app.on)r.app.on('browser-window-created',(e,w)=>{applyFix(w);w.on('show',()=>applyFix(w));w.on('ready-to-show',()=>applyFix(w));});
+try{Object.defineProperty(r,'__ff',{value:true,writable:false,configurable:false,enumerable:false});}catch(e){}}
 return r;};
 WRAP
+
+    # 3. Update-checker (polling in-app + tray icon + dialog versione)
+    # Versione completa coerente con quella scritta dallo script di build.
+    cat > "${extracted}/update-checker.js" <<'UPDATER_JS'
+'use strict';
+const { app, Notification, dialog, shell, Menu, Tray, BrowserWindow } = require('electron');
+const { spawn } = require('child_process');
+const https = require('https');
+const fs = require('fs');
+
+const RELEASES_URL = 'https://downloads.claude.ai/releases/win32/x64/RELEASES';
+const CHECK_INTERVAL_MS = 60 * 60 * 1000;
+const FIRST_CHECK_DELAY_MS = 5 * 1000;
+const INSTALLED_VERSION_PATH = '/usr/lib/claude-desktop/.installed-version';
+
+let lastNotifiedVersion = null;
+let lastKnownRemote = null;
+let lastCheckTime = null;
+let isChecking = false;
+let trayInstance = null;
+
+function log(...args) { console.log('[update-checker]', ...args); }
+
+function getInstalledVersion() {
+    try {
+        if (fs.existsSync(INSTALLED_VERSION_PATH)) {
+            return fs.readFileSync(INSTALLED_VERSION_PATH, 'utf8').trim();
+        }
+    } catch (e) {}
+    try { return require('./package.json').version || '0.0.0'; }
+    catch (e) { return '0.0.0'; }
+}
+
+function fetchLatestVersion() {
+    return new Promise((resolve, reject) => {
+        const req = https.get(RELEASES_URL, { timeout: 15000 }, (res) => {
+            if (res.statusCode !== 200) return reject(new Error('HTTP ' + res.statusCode));
+            let data = '';
+            res.setEncoding('utf8');
+            res.on('data', (c) => data += c);
+            res.on('end', () => {
+                const lines = data.split(/\r?\n/).filter((l) => l.includes('-full.nupkg'));
+                if (lines.length === 0) return reject(new Error('Nessuna riga -full.nupkg'));
+                const last = lines[lines.length - 1].trim().split(/\s+/);
+                const nupkgName = last[1];
+                const m = nupkgName && nupkgName.match(/(\d+\.\d+\.\d+)-full/);
+                if (!m) return reject(new Error('Formato non valido'));
+                resolve({ version: m[1], nupkgName });
+            });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+    });
+}
+
+function versionGt(a, b) {
+    const pa = a.split('.').map(Number);
+    const pb = b.split('.').map(Number);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const x = pa[i] || 0, y = pb[i] || 0;
+        if (x > y) return true;
+        if (x < y) return false;
+    }
+    return false;
+}
+
+function spawnClaudeUpdate(arg) {
+    const env = Object.assign({}, process.env);
+    const child = spawn('/usr/bin/claude-update', [arg], {
+        detached: true, stdio: 'ignore', env: env, cwd: env.HOME || '/tmp',
+    });
+    child.unref();
+}
+
+function notifyUpdateAvailable(currentVer, latestVer) {
+    if (lastNotifiedVersion === latestVer) return;
+    lastNotifiedVersion = latestVer;
+    if (!Notification.isSupported()) return;
+    const n = new Notification({
+        title: 'Aggiornamento Claude Desktop disponibile',
+        body: `Nuova versione: ${latestVer}\nInstallata: ${currentVer}\nClicca per aggiornare.`,
+    });
+    n.on('click', () => showUpgradeDialog(currentVer, latestVer));
+    n.show();
+}
+
+function showUpgradeDialog(currentVer, latestVer) {
+    const choice = dialog.showMessageBoxSync({
+        type: 'question',
+        title: 'Aggiornamento Claude Desktop',
+        message: `È disponibile la versione ${latestVer}`,
+        detail: `Versione installata: ${currentVer}\n\nL'aggiornamento scaricherà il pacchetto da Anthropic (~200 MB), lo patcherà per Linux e lo installerà sul sistema. Ti verrà chiesta la password di amministratore.\n\nClaude verrà riavviato al termine.`,
+        buttons: ['Aggiorna ora', 'Più tardi'],
+        defaultId: 0, cancelId: 1,
+    });
+    if (choice === 0) spawnClaudeUpdate('--upgrade');
+}
+
+function notifyEndpointError(errorMsg) {
+    if (lastNotifiedVersion === 'ERROR') return;
+    lastNotifiedVersion = 'ERROR';
+    if (!Notification.isSupported()) return;
+    const n = new Notification({
+        title: 'Controllo aggiornamenti Claude fallito',
+        body: 'Anthropic potrebbe aver cambiato il meccanismo di pubblicazione.',
+        silent: true,
+    });
+    n.on('click', () => {
+        const choice = dialog.showMessageBoxSync({
+            type: 'warning', title: 'Controllo aggiornamenti fallito',
+            message: 'Non riesco a contattare l\'endpoint di aggiornamento',
+            detail: `Errore: ${errorMsg}`,
+            buttons: ['Apri diagnostica', 'Ignora'], defaultId: 0, cancelId: 1,
+        });
+        if (choice === 0) spawnClaudeUpdate('--diagnose');
+    });
+    n.show();
+}
+
+async function performCheck() {
+    if (isChecking) return;
+    isChecking = true;
+    try {
+        const installed = getInstalledVersion();
+        const remote = await fetchLatestVersion();
+        lastKnownRemote = remote;
+        lastCheckTime = new Date();
+        if (versionGt(remote.version, installed)) {
+            notifyUpdateAvailable(installed, remote.version);
+        } else {
+            if (lastNotifiedVersion === 'ERROR') lastNotifiedVersion = null;
+        }
+    } catch (err) {
+        log('Check fallito:', err.message);
+        notifyEndpointError(err.message);
+    } finally { isChecking = false; }
+}
+
+async function checkForUpdatesNow() {
+    try {
+        const remote = await fetchLatestVersion();
+        lastKnownRemote = remote;
+        lastCheckTime = new Date();
+        const installed = getInstalledVersion();
+        if (versionGt(remote.version, installed)) {
+            notifyUpdateAvailable(installed, remote.version);
+        } else if (Notification.isSupported()) {
+            new Notification({
+                title: 'Claude Desktop è aggiornato',
+                body: `Hai la versione più recente (${installed}).`, silent: true,
+            }).show();
+        }
+    } catch (err) { notifyEndpointError(err.message); }
+}
+
+async function showVersionInfo() {
+    const installed = getInstalledVersion();
+    const needsFresh = !lastCheckTime || (Date.now() - lastCheckTime.getTime()) > 5 * 60 * 1000;
+    let remote = lastKnownRemote;
+    let checkError = null;
+    if (needsFresh) {
+        try {
+            remote = await fetchLatestVersion();
+            lastKnownRemote = remote;
+            lastCheckTime = new Date();
+        } catch (err) { checkError = err.message; }
+    }
+    if (checkError) {
+        const choice = dialog.showMessageBoxSync({
+            type: 'warning', title: 'Info versione Claude Desktop',
+            message: `Versione installata: ${installed}`,
+            detail: `Impossibile verificare aggiornamenti: ${checkError}`,
+            buttons: ['Apri diagnostica', 'OK'], defaultId: 1, cancelId: 1,
+        });
+        if (choice === 0) spawnClaudeUpdate('--diagnose');
+        return;
+    }
+    if (versionGt(remote.version, installed)) {
+        showUpgradeDialog(installed, remote.version);
+    } else {
+        dialog.showMessageBoxSync({
+            type: 'info', title: 'Info versione Claude Desktop',
+            message: 'Claude Desktop è aggiornato',
+            detail: `Versione installata: ${installed}\nUltima disponibile: ${remote.version}`,
+            buttons: ['OK'],
+        });
+    }
+}
+
+function toggleMainWindow() {
+    try {
+        const ws = BrowserWindow.getAllWindows();
+        if (!ws || ws.length === 0) return;
+        const main = ws.find((w) => w.isVisible()) || ws[0];
+        if (main.isVisible() && main.isFocused()) main.hide();
+        else { if (!main.isVisible()) main.show(); main.focus(); }
+    } catch (e) {}
+}
+
+function handleNewWindowHideUntilMenuRemoved(win) {
+    try {
+        win.hide();
+        if (typeof win.setMenu === 'function') win.setMenu(null);
+        if (typeof win.setMenuBarVisibility === 'function') win.setMenuBarVisibility(false);
+        Menu.setApplicationMenu(null);
+        setInterval(() => {
+            try {
+                Menu.setApplicationMenu(null);
+                BrowserWindow.getAllWindows().forEach((w) => {
+                    try {
+                        if (typeof w.setMenu === 'function') w.setMenu(null);
+                        if (typeof w.setMenuBarVisibility === 'function') w.setMenuBarVisibility(false);
+                    } catch (e) {}
+                });
+            } catch (e) {}
+        }, 200);
+        const showWhenReady = () => {
+            try {
+                Menu.setApplicationMenu(null);
+                if (typeof win.setMenu === 'function') win.setMenu(null);
+                if (typeof win.setMenuBarVisibility === 'function') win.setMenuBarVisibility(false);
+                win.show();
+                win.focus();
+            } catch (e) {}
+        };
+        setTimeout(showWhenReady, 5000);
+    } catch (e) {
+        try { win.show(); } catch (e2) {}
+    }
+}
+
+function setupTrayIcon() {
+    try {
+        const iconCandidates = [
+            '/usr/share/icons/hicolor/256x256/apps/claude.png',
+            '/usr/share/icons/hicolor/128x128/apps/claude.png',
+            '/usr/share/icons/hicolor/64x64/apps/claude.png',
+            '/usr/share/icons/hicolor/48x48/apps/claude.png',
+            '/usr/share/icons/hicolor/32x32/apps/claude.png',
+        ];
+        let iconPath = null;
+        for (const c of iconCandidates) if (fs.existsSync(c)) { iconPath = c; break; }
+        if (!iconPath) return;
+
+        trayInstance = new Tray(iconPath);
+        trayInstance.setToolTip('Claude Desktop');
+
+        const buildMenu = () => Menu.buildFromTemplate([
+            { label: `Claude Desktop v${getInstalledVersion()}`, enabled: false },
+            { type: 'separator' },
+            { label: 'Mostra/Nascondi finestra', click: toggleMainWindow },
+            { type: 'separator' },
+            { label: 'Verifica aggiornamenti', click: () => checkForUpdatesNow() },
+            { label: 'Info versione e aggiornamenti…', click: () => showVersionInfo() },
+            { type: 'separator' },
+            { label: 'Esci', click: () => app.quit() },
+        ]);
+        trayInstance.setContextMenu(buildMenu());
+        trayInstance.on('click', toggleMainWindow);
+    } catch (e) { log('Tray error:', e.message); }
+}
+
+app.whenReady().then(() => {
+    Menu.setApplicationMenu(null);
+    app.on('browser-window-created', (event, win) => {
+        handleNewWindowHideUntilMenuRemoved(win);
+    });
+    BrowserWindow.getAllWindows().forEach((w) => {
+        try {
+            if (typeof w.setMenu === 'function') w.setMenu(null);
+            if (typeof w.setMenuBarVisibility === 'function') w.setMenuBarVisibility(false);
+        } catch (e) {}
+    });
+    setTimeout(setupTrayIcon, 3000);
+    setTimeout(performCheck, FIRST_CHECK_DELAY_MS);
+    setInterval(performCheck, CHECK_INTERVAL_MS);
+});
+UPDATER_JS
+
+    # 4. Frame-fix-entry: include sia frame-fix-wrapper che update-checker
     cat > "${extracted}/frame-fix-entry.js" <<'ENTRY'
-'use strict';require('./frame-fix-wrapper');require('./.vite/build/index.js');
+'use strict';
+require('./frame-fix-wrapper');
+try { require('./update-checker'); }
+catch (e) { console.error('[update-checker] errore caricamento:', e.message); }
+require('./.vite/build/index.js');
 ENTRY
 
     # Aggiorna package.json main
