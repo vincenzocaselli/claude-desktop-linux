@@ -158,8 +158,12 @@ ok "Estrazione completata"
 # =============================================================================
 info "Setup tooling locale (@electron/asar)..."
 mkdir -p "${WORKDIR}/npm-tools"
-npm install --prefix "${WORKDIR}/npm-tools" @electron/asar >/dev/null 2>&1 \
-    || die "Installazione @electron/asar fallita"
+# Pin a versione compatibile con Node 18 (la latest richiede Node 22+ e usa
+# "import with {type:'json'}" non supportato). @electron/asar@3.2.x è
+# l'ultima serie compatibile con Node 18+. Fallback su 'asar' deprecato.
+npm install --prefix "${WORKDIR}/npm-tools" '@electron/asar@~3.2.0' >/dev/null 2>&1 \
+    || npm install --prefix "${WORKDIR}/npm-tools" 'asar@~3.2.0' >/dev/null 2>&1 \
+    || die "Installazione asar fallita"
 ASAR="${WORKDIR}/npm-tools/node_modules/.bin/asar"
 
 info "Estrazione app.asar..."
@@ -182,7 +186,17 @@ STUB
 
 # ── Frame fix wrapper ──────────────────────────────────────────────────────
 info "Scrittura frame-fix-wrapper.js..."
-cat > "${WORKDIR}/app-extracted/frame-fix-wrapper.js" << 'FRAMEWRAP'
+# =============================================================================
+# REFACTORING: i 3 file JS (wrapper, entry, update-checker) vengono scritti
+# UNA SOLA VOLTA in ${WORKDIR}/patches/. Poi:
+#   - Vengono copiati in app-extracted/ per il primo packaging
+#   - Vengono inclusi nel pacchetto come /usr/lib/claude-desktop/patches/
+#     così claude-update --upgrade può ri-applicarli identici dopo
+#     aver estratto il nuovo asar di una versione futura.
+# Questo evita drift tra "versione build" e "versione upgrade" dei file.
+# =============================================================================
+mkdir -p "${WORKDIR}/patches"
+cat > "${WORKDIR}/patches/frame-fix-wrapper.js" << 'FRAMEWRAP'
 'use strict';
 const Module = require('module');
 const originalLoad = Module._load;
@@ -327,7 +341,7 @@ fi
 
 # ── update-checker.js (polling in-app + tray icon) ──────────────────────────
 info "Scrittura update-checker.js..."
-cat > "${WORKDIR}/app-extracted/update-checker.js" << 'UPDATER_JS'
+cat > "${WORKDIR}/patches/update-checker.js" << 'UPDATER_JS'
 'use strict';
 const { app, Notification, dialog, shell, Menu, Tray, BrowserWindow } = require('electron');
 const { spawn } = require('child_process');
@@ -608,13 +622,30 @@ UPDATER_JS
 
 # ── frame-fix-entry.js (entry point principale) ─────────────────────────────
 info "Scrittura frame-fix-entry.js..."
-cat > "${WORKDIR}/app-extracted/frame-fix-entry.js" << 'ENTRY'
+cat > "${WORKDIR}/patches/frame-fix-entry.js" << 'ENTRY'
 'use strict';
 require('./frame-fix-wrapper');
 try { require('./update-checker'); }
 catch (e) { console.error('[update-checker] errore:', e.message); }
 require('./.vite/build/index.js');
 ENTRY
+
+# ── Verifica e copia i 3 file patch in app-extracted/ ───────────────────────
+# Verifica esistenza e non-vuotezza
+for f in frame-fix-wrapper.js frame-fix-entry.js update-checker.js; do
+    [[ -s "${WORKDIR}/patches/${f}" ]] \
+        || die "File patch mancante o vuoto: ${WORKDIR}/patches/${f}"
+done
+# Verifica sintassi JavaScript (fail-fast)
+for f in frame-fix-wrapper.js frame-fix-entry.js update-checker.js; do
+    node -c "${WORKDIR}/patches/${f}" 2>/dev/null \
+        || die "Errore di sintassi in ${f}"
+done
+# Copia i file nell'asar estratto per il primo packaging
+cp "${WORKDIR}/patches/frame-fix-wrapper.js" "${WORKDIR}/app-extracted/"
+cp "${WORKDIR}/patches/frame-fix-entry.js"   "${WORKDIR}/app-extracted/"
+cp "${WORKDIR}/patches/update-checker.js"    "${WORKDIR}/app-extracted/"
+ok "File patch scritti e copiati in app-extracted (sintassi verificata)"
 
 # ── Modifica package.json: main → frame-fix-entry.js ────────────────────────
 PKGJSON="${WORKDIR}/app-extracted/package.json"
@@ -686,6 +717,18 @@ cp "${WORKDIR}/app-patched.asar" "${PKGDIR}/usr/lib/claude-desktop/app.asar"
 # Versione installata (letta da claude-update e dall'app)
 echo "${PKG_VERSION}" > "${PKGDIR}/usr/lib/claude-desktop/.installed-version"
 
+# Copia i 3 file patch in /usr/lib/claude-desktop/patches/ così claude-update
+# --upgrade può riapplicarli identici quando aggiorna l'asar a versione nuova.
+# Single source of truth: evita drift tra build e apply_patches.
+mkdir -p "${PKGDIR}/usr/lib/claude-desktop/patches"
+cp "${WORKDIR}/patches/frame-fix-wrapper.js" \
+   "${PKGDIR}/usr/lib/claude-desktop/patches/"
+cp "${WORKDIR}/patches/frame-fix-entry.js"   \
+   "${PKGDIR}/usr/lib/claude-desktop/patches/"
+cp "${WORKDIR}/patches/update-checker.js"    \
+   "${PKGDIR}/usr/lib/claude-desktop/patches/"
+ok "Patch files installati in /usr/lib/claude-desktop/patches/"
+
 # Electron dist
 mkdir -p "${PKGDIR}/usr/lib/claude-desktop/electron-dist"
 cp -r "${ELECTRON_DIST}"/* "${PKGDIR}/usr/lib/claude-desktop/electron-dist/"
@@ -713,7 +756,7 @@ Icon=claude
 Terminal=false
 Type=Application
 Categories=Office;Utility;Network;
-StartupWMClass=Claude
+StartupWMClass=claude
 MimeType=x-scheme-handler/claude;
 DESKTOP
 
@@ -869,7 +912,10 @@ do_inplace_upgrade() {
     asar_tool=$(command -v asar 2>/dev/null \
         || find /usr/lib/claude-desktop -name "asar" -type f 2>/dev/null | head -1)
     if [[ -z "${asar_tool}" ]]; then
-        npm install --prefix "${staging}/npm-tools" @electron/asar >/dev/null 2>&1 || return 1
+        # Pin a versione compatibile con Node 18 (latest richiede Node 22+).
+        npm install --prefix "${staging}/npm-tools" '@electron/asar@~3.2.0' >/dev/null 2>&1 \
+            || npm install --prefix "${staging}/npm-tools" 'asar@~3.2.0' >/dev/null 2>&1 \
+            || return 1
         asar_tool="${staging}/npm-tools/node_modules/.bin/asar"
     fi
 
@@ -911,11 +957,18 @@ do_inplace_upgrade() {
     return 0
 }
 
+# Applica le patch necessarie all'asar estratto:
+#   - Stub @ant/claude-native (modulo nativo Windows non disponibile su Linux)
+#   - I 3 file JS presi da /usr/lib/claude-desktop/patches/ (single source of truth)
+#   - File i18n copiati dentro l'asar
+#   - Aggiornamento package.json: main = ./frame-fix-entry.js
+#   - Patch CCD inline (getHostPlatform) per supporto Linux di Claude Code
 apply_patches() {
     local extracted="$1"
     local nupkg_extract="$2"
+    local patches_dir="/usr/lib/claude-desktop/patches"
 
-    # Stub claude-native
+    # 1. Stub @ant/claude-native (modulo nativo Windows)
     local native_dir
     native_dir=$(find "${extracted}" -type d -name "claude-native" | head -1)
     [[ -z "${native_dir}" ]] && native_dir="${extracted}/node_modules/@ant/claude-native"
@@ -930,25 +983,24 @@ const AuthRequest={isAvailable:()=>false,start:(_u,cb)=>cb&&cb(null,new Error('N
 module.exports={KeyboardKey,AuthRequest,getWindowsWithSameApp:()=>[],getMonitorList:()=>[],getMouseLocation:()=>({x:0,y:0}),getTotalMemory:()=>4*1024*1024*1024,getWindowTitle:()=>'',moveMouseTo:()=>{},simulateKey:()=>{},screenCapture:()=>null,setGlobalShortcut:()=>true,unsetGlobalShortcut:()=>{},getSystemTheme:()=>'dark',onWindowFocusChanged:()=>{},getResourcesPath:()=>'/usr/lib/claude-desktop'};
 STUB
 
-    # Frame fix
-    cat > "${extracted}/frame-fix-wrapper.js" <<'WRAP'
+    # 2. File patch da /usr/lib/claude-desktop/patches (installati dal pacchetto)
+    if [[ -d "${patches_dir}" ]]; then
+        cp "${patches_dir}/frame-fix-wrapper.js" "${extracted}/" || return 1
+        cp "${patches_dir}/frame-fix-entry.js"   "${extracted}/" || return 1
+        cp "${patches_dir}/update-checker.js"    "${extracted}/" || return 1
+    else
+        # Fallback per pacchetti vecchi (pre-refactoring): entry minimo
+        echo "[WARN] /usr/lib/claude-desktop/patches/ non trovata." >&2
+        echo "[WARN] Reinstalla il pacchetto: ./build-claude-desktop-arch.sh && sudo pacman -U claude-desktop-*.pkg.tar.zst" >&2
+        cat > "${extracted}/frame-fix-entry.js" <<'ENTRY'
 'use strict';
-const Module=require('module');const orig=Module._load;
-let _v=null;
-function getV(){if(_v!==null)return _v;try{_v=require('./package.json').version||'';}catch(e){_v='';}return _v;}
-function applyTitle(w){if(!w||!w.getTitle)return;const v=getV();if(!v)return;const s=' — v'+v;
-const upd=()=>{try{const c=w.getTitle();if(c&&!c.endsWith(s))w.setTitle(c.replace(/ — v\d+\.\d+\.\d+$/,'')+s);}catch(e){}};
-upd();try{w.on('page-title-updated',()=>setTimeout(upd,0));}catch(e){}
-let n=0;const i=setInterval(()=>{upd();if(++n>=30)clearInterval(i);},1000);}
-function applyFix(w){if(!w)return;try{w.setMenuBarVisibility&&w.setMenuBarVisibility(true);w.setAutoHideMenuBar&&w.setAutoHideMenuBar(false);applyTitle(w);}catch(e){}}
-Module._load=function(req,p,m){const r=orig.apply(this,arguments);
-if(req==='electron'&&r&&!r.__ff){['BrowserWindow','BaseWindow'].forEach(c=>{if(r[c]){const O=r[c];class P extends O{constructor(o={}){super(Object.assign({},o,{frame:true,titleBarStyle:'default',autoHideMenuBar:false}));applyFix(this);}}
-try{Object.defineProperty(r,c,{value:P,writable:true,configurable:true});}catch(e){}}});
-if(r.app)r.app.on('browser-window-created',(e,w)=>{applyFix(w);w.on('show',()=>applyFix(w));w.on('ready-to-show',()=>applyFix(w));});
-try{Object.defineProperty(r,'__ff',{value:true});}catch(e){}}return r;};
-WRAP
+try { require('./frame-fix-wrapper'); } catch (e) {}
+try { require('./update-checker'); } catch (e) {}
+require('./.vite/build/index.js');
+ENTRY
+    fi
 
-    # Update package.json
+    # 3. Aggiorna package.json: main → frame-fix-entry.js
     local pkgjson="${extracted}/package.json"
     if [[ -f "${pkgjson}" ]]; then
         node -e "
@@ -959,12 +1011,7 @@ WRAP
         " 2>/dev/null || true
     fi
 
-    # Entry
-    cat > "${extracted}/frame-fix-entry.js" <<'ENTRY'
-'use strict';require('./frame-fix-wrapper');try{require('./update-checker');}catch(e){}require('./.vite/build/index.js');
-ENTRY
-
-    # i18n
+    # 4. Copia i file i18n dentro l'asar
     mkdir -p "${extracted}/resources/i18n"
     find "${nupkg_extract}" -name "*-*.json" \
         ! -path "*/node_modules/*" ! -name "package*.json" 2>/dev/null \
@@ -974,21 +1021,40 @@ ENTRY
     [[ -f "${extracted}/resources/i18n/en-US.json" ]] \
         || echo '{}' > "${extracted}/resources/i18n/en-US.json"
 
-    # Patch CCD
+    # 5. Patch Claude Code (CCD) per supporto Linux
     local vite_index="${extracted}/.vite/build/index.js"
     if [[ -f "${vite_index}" ]]; then
-        local patch_js="${staging}/patch-ccd.js"
+        local staging_dir="$(dirname "${extracted}")"
+        local patch_js="${staging_dir}/patch-ccd.js"
         cat > "${patch_js}" << 'PATCHCCD'
 'use strict';
 const fs = require('fs');
 const p = process.argv[2];
 if (!p) process.exit(1);
-let s; try { s = fs.readFileSync(p, 'utf8'); } catch (e) { process.exit(1); }
-const needle = 'if(process.platform==="win32")return A==="arm64"?"win32-arm64":"win32-x64";';
-const repl = needle + 'if(process.platform==="linux")return A==="arm64"?"linux-arm64":"linux-x64";';
+let s;
+try { s = fs.readFileSync(p, 'utf8'); } catch (e) { process.exit(1); }
+const needle =
+    'if(process.platform==="win32")return A==="arm64"?"win32-arm64":"win32-x64";';
+const repl =
+    'if(process.platform==="win32")return A==="arm64"?"win32-arm64":"win32-x64";' +
+    'if(process.platform==="linux")return A==="arm64"?"linux-arm64":"linux-x64";';
 if (s.includes(needle) && !s.includes('if(process.platform==="linux")return A==="arm64"?"linux-arm64"')) {
     s = s.split(needle).join(repl);
     fs.writeFileSync(p, s, 'utf8');
+}
+PATCHCCD
+        node "${patch_js}" "${vite_index}" 2>/dev/null || true
+    fi
+
+    # 6. Verifica sintassi dei 3 file JS prima del repack (fail-fast)
+    for jsf in frame-fix-wrapper.js frame-fix-entry.js update-checker.js; do
+        if [[ -f "${extracted}/${jsf}" ]]; then
+            node -c "${extracted}/${jsf}" 2>/dev/null \
+                || { echo "[ERROR] Sintassi non valida: ${jsf}" >&2; return 1; }
+        fi
+    done
+
+    return 0
 }
 PATCHCCD
         node "${patch_js}" "${vite_index}" 2>/dev/null || true
