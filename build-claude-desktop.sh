@@ -506,7 +506,17 @@ find "${WORKDIR}/app.asar.unpacked" -name "*.node" \
 # Questo wrapper intercetta require('electron') e forza frame:true.
 
 info "Scrittura frame-fix-wrapper.js..."
-cat > "${WORKDIR}/app-extracted/frame-fix-wrapper.js" << 'FRAMEWRAP'
+# =============================================================================
+# REFACTORING: i 3 file JS (wrapper, entry, update-checker) vengono scritti
+# UNA SOLA VOLTA in ${WORKDIR}/patches/. Poi:
+#   - Vengono copiati in app-extracted/ per il primo packaging
+#   - Vengono inclusi nel .deb come /usr/lib/claude-desktop/patches/
+#     così claude-update --upgrade può ri-applicarli identici dopo
+#     aver estratto il nuovo asar di una versione futura.
+# Questo evita drift tra "versione build" e "versione upgrade" dei file.
+# =============================================================================
+mkdir -p "${WORKDIR}/patches"
+cat > "${WORKDIR}/patches/frame-fix-wrapper.js" << 'FRAMEWRAP'
 /**
  * frame-fix-wrapper.js
  * Forza title bar nativa e menu bar visibili su Linux.
@@ -673,7 +683,7 @@ console.log('[frame-fix] wrapper caricato');
 FRAMEWRAP
 
 info "Scrittura frame-fix-entry.js..."
-cat > "${WORKDIR}/app-extracted/frame-fix-entry.js" << 'FRAMEENTRY'
+cat > "${WORKDIR}/patches/frame-fix-entry.js" << 'FRAMEENTRY'
 /**
  * frame-fix-entry.js
  * Entry point che carica:
@@ -695,7 +705,7 @@ require('./.vite/build/index.js');
 FRAMEENTRY
 
 info "Scrittura update-checker.js (polling aggiornamenti in-app)..."
-cat > "${WORKDIR}/app-extracted/update-checker.js" << 'UPDATER_JS'
+cat > "${WORKDIR}/patches/update-checker.js" << 'UPDATER_JS'
 /**
  * update-checker.js
  * Polling orario dell'endpoint RELEASES di Anthropic per rilevare
@@ -1226,6 +1236,25 @@ app.whenReady().then(() => {
 });
 UPDATER_JS
 
+# ── Copia i file patch in app-extracted/ per il packaging corrente ──────────
+# Verifica che tutti e 3 i file siano stati scritti correttamente
+for f in frame-fix-wrapper.js frame-fix-entry.js update-checker.js; do
+    [[ -s "${WORKDIR}/patches/${f}" ]] \
+        || die "File patch mancante o vuoto: ${WORKDIR}/patches/${f}"
+done
+
+# Verifica sintassi JavaScript di ognuno (fail-fast se c'è un typo)
+for f in frame-fix-wrapper.js frame-fix-entry.js update-checker.js; do
+    node -c "${WORKDIR}/patches/${f}" 2>/dev/null \
+        || die "Errore di sintassi in ${f}"
+done
+
+# Copia i 3 file dentro l'asar estratto
+cp "${WORKDIR}/patches/frame-fix-wrapper.js" "${WORKDIR}/app-extracted/"
+cp "${WORKDIR}/patches/frame-fix-entry.js"   "${WORKDIR}/app-extracted/"
+cp "${WORKDIR}/patches/update-checker.js"    "${WORKDIR}/app-extracted/"
+ok "File patch scritti e copiati in app-extracted (sintassi verificata)"
+
 # Aggiorna package.json per usare il nostro entry point
 PKGJSON_PATH="${WORKDIR}/app-extracted/package.json"
 if [[ -f "${PKGJSON_PATH}" ]]; then
@@ -1388,6 +1417,19 @@ fi
 # sul sistema; viene aggiornato anche da claude-update --upgrade.
 echo "${DEB_VERSION}" > "${DEBROOT}/usr/lib/claude-desktop/.installed-version"
 
+# Copia i 3 file patch in /usr/lib/claude-desktop/patches/ così claude-update
+# --upgrade può riapplicarli identici quando aggiorna l'asar a versione nuova.
+# Questo evita il drift tra "versione build" e "versione apply_patches" che
+# causava la sparizione della title bar dopo upgrade in-place.
+mkdir -p "${DEBROOT}/usr/lib/claude-desktop/patches"
+cp "${WORKDIR}/patches/frame-fix-wrapper.js" \
+   "${DEBROOT}/usr/lib/claude-desktop/patches/"
+cp "${WORKDIR}/patches/frame-fix-entry.js"   \
+   "${DEBROOT}/usr/lib/claude-desktop/patches/"
+cp "${WORKDIR}/patches/update-checker.js"    \
+   "${DEBROOT}/usr/lib/claude-desktop/patches/"
+ok "Patch files installati in /usr/lib/claude-desktop/patches/"
+
 # Copia resources/ (i18n e altri asset): Electron li cerca nella stessa
 # directory di app.asar, quindi devono stare in /usr/lib/claude-desktop/resources/
 if [[ -d "${WORKDIR}/resources" ]]; then
@@ -1462,7 +1504,7 @@ Icon=claude
 Terminal=false
 Type=Application
 Categories=Office;Utility;Network;
-StartupWMClass=Claude
+StartupWMClass=claude
 MimeType=x-scheme-handler/claude;
 DESKTOP
 
@@ -1725,14 +1767,20 @@ do_inplace_upgrade() {
     return 0
 }
 
-# Applica le patch minime necessarie (stub native + frame fix + i18n)
-# NOTA: mantiene coerenza con le patch dello script di build principale.
-# Se l'upstream cambia struttura, queste vanno aggiornate in entrambi i posti.
+# Applica le patch necessarie all'asar estratto:
+#   - Stub @ant/claude-native (modulo nativo Windows, non disponibile su Linux)
+#   - I 3 file JS (frame-fix-wrapper, frame-fix-entry, update-checker) presi
+#     da /usr/lib/claude-desktop/patches/ (single source of truth installato
+#     dal .deb). Questo evita drift tra "versione build" e "versione upgrade".
+#   - File i18n copiati dentro l'asar (l'app li cerca lì)
+#   - Aggiornamento package.json: main = ./frame-fix-entry.js
+#   - Patch CCD inline (getHostPlatform) per supporto Linux di Claude Code
 apply_patches() {
     local extracted="$1"
     local nupkg_extract="$2"
+    local patches_dir="/usr/lib/claude-desktop/patches"
 
-    # 1. Stub @ant/claude-native
+    # 1. Stub @ant/claude-native (modulo nativo Windows)
     local native_dir
     native_dir=$(find "${extracted}" -type d -name "claude-native" | head -1)
     [[ -z "${native_dir}" ]] && native_dir="${extracted}/node_modules/@ant/claude-native"
@@ -1747,316 +1795,29 @@ const AuthRequest={isAvailable:()=>false,start:(_u,cb)=>cb&&cb(null,new Error('N
 module.exports={KeyboardKey,AuthRequest,getWindowsWithSameApp:()=>[],getMonitorList:()=>[],getMouseLocation:()=>({x:0,y:0}),getTotalMemory:()=>4*1024*1024*1024,getWindowTitle:()=>'',moveMouseTo:()=>{},simulateKey:()=>{},screenCapture:()=>null,setGlobalShortcut:()=>true,unsetGlobalShortcut:()=>{},getSystemTheme:()=>'dark',onWindowFocusChanged:()=>{},getResourcesPath:()=>'/usr/lib/claude-desktop'};
 STUB
 
-    # 2. Frame fix wrapper (versione completa: BrowserWindow + BaseWindow,
-    #    suffisso versione nel titolo, listener browser-window-created)
-    cat > "${extracted}/frame-fix-wrapper.js" <<'WRAP'
+    # 2. File patch da /usr/lib/claude-desktop/patches (installati dal .deb)
+    #    Questa è la "single source of truth": gli stessi file usati dal build.
+    if [[ -d "${patches_dir}" ]]; then
+        cp "${patches_dir}/frame-fix-wrapper.js" "${extracted}/" || return 1
+        cp "${patches_dir}/frame-fix-entry.js"   "${extracted}/" || return 1
+        cp "${patches_dir}/update-checker.js"    "${extracted}/" || return 1
+    else
+        # Fallback: directory patches non presente (versione vecchia del .deb).
+        # Significa che l'utente ha installato un .deb pre-refactoring e ora sta
+        # facendo --upgrade. Avvertiamo che dovrebbero ricostruire il .deb,
+        # ma proseguiamo creando file minimal inline per non rompere l'upgrade.
+        echo "[WARN] /usr/lib/claude-desktop/patches/ non trovata." >&2
+        echo "[WARN] Reinstalla il .deb dopo: ./build-claude-desktop.sh && sudo dpkg -i claude-desktop_*.deb" >&2
+        # Frame-fix-entry minimo: carica wrapper + checker se esistono
+        cat > "${extracted}/frame-fix-entry.js" <<'ENTRY'
 'use strict';
-const Module=require('module');const orig=Module._load;
-let _v=null;
-function getV(){if(_v!==null)return _v;try{_v=require('./package.json').version||'';}catch(e){_v='';}return _v;}
-function applyTitle(w){if(!w||!w.getTitle)return;const v=getV();if(!v)return;const s=' — v'+v;
-const upd=()=>{try{const c=w.getTitle();if(c&&!c.endsWith(s))w.setTitle(c.replace(/ — v\d+\.\d+\.\d+$/,'')+s);}catch(e){}};
-upd();try{w.on('page-title-updated',()=>setTimeout(upd,0));}catch(e){}
-let n=0;const i=setInterval(()=>{upd();if(++n>=30)clearInterval(i);},1000);}
-function applyFix(w){if(!w)return;try{w.setMenuBarVisibility&&w.setMenuBarVisibility(true);w.setAutoHideMenuBar&&w.setAutoHideMenuBar(false);applyTitle(w);}catch(e){}}
-Module._load=function(req,parent,isMain){const r=orig.apply(this,arguments);
-if(req==='electron'&&r&&!r.__ff){['BrowserWindow','BaseWindow'].forEach(c=>{if(r[c]){const O=r[c];
-class P extends O{constructor(o={}){const po=Object.assign({},o,{frame:true,titleBarStyle:'default',autoHideMenuBar:false});delete po.titleBarOverlay;super(po);applyFix(this);}}
-Object.getOwnPropertyNames(O).forEach(p=>{if(!['length','name','prototype'].includes(p)){try{P[p]=O[p];}catch(e){}}});
-try{Object.defineProperty(r,c,{value:P,writable:true,configurable:true});}catch(e){}}});
-if(r.app&&r.app.on)r.app.on('browser-window-created',(e,w)=>{applyFix(w);w.on('show',()=>applyFix(w));w.on('ready-to-show',()=>applyFix(w));});
-try{Object.defineProperty(r,'__ff',{value:true,writable:false,configurable:false,enumerable:false});}catch(e){}}
-return r;};
-WRAP
-
-    # 3. Update-checker (polling in-app + tray icon + dialog versione)
-    # Versione completa coerente con quella scritta dallo script di build.
-    cat > "${extracted}/update-checker.js" <<'UPDATER_JS'
-'use strict';
-const { app, Notification, dialog, shell, Menu, Tray, BrowserWindow } = require('electron');
-const { spawn } = require('child_process');
-const https = require('https');
-const fs = require('fs');
-
-const RELEASES_URL = 'https://downloads.claude.ai/releases/win32/x64/RELEASES';
-const CHECK_INTERVAL_MS = 60 * 60 * 1000;
-const FIRST_CHECK_DELAY_MS = 5 * 1000;
-const INSTALLED_VERSION_PATH = '/usr/lib/claude-desktop/.installed-version';
-
-let lastNotifiedVersion = null;
-let lastKnownRemote = null;
-let lastCheckTime = null;
-let isChecking = false;
-let trayInstance = null;
-
-function log(...args) { console.log('[update-checker]', ...args); }
-
-function getInstalledVersion() {
-    try {
-        if (fs.existsSync(INSTALLED_VERSION_PATH)) {
-            return fs.readFileSync(INSTALLED_VERSION_PATH, 'utf8').trim();
-        }
-    } catch (e) {}
-    try { return require('./package.json').version || '0.0.0'; }
-    catch (e) { return '0.0.0'; }
-}
-
-function fetchLatestVersion() {
-    return new Promise((resolve, reject) => {
-        const req = https.get(RELEASES_URL, { timeout: 15000 }, (res) => {
-            if (res.statusCode !== 200) return reject(new Error('HTTP ' + res.statusCode));
-            let data = '';
-            res.setEncoding('utf8');
-            res.on('data', (c) => data += c);
-            res.on('end', () => {
-                const lines = data.split(/\r?\n/).filter((l) => l.includes('-full.nupkg'));
-                if (lines.length === 0) return reject(new Error('Nessuna riga -full.nupkg'));
-                const last = lines[lines.length - 1].trim().split(/\s+/);
-                const nupkgName = last[1];
-                const m = nupkgName && nupkgName.match(/(\d+\.\d+\.\d+)-full/);
-                if (!m) return reject(new Error('Formato non valido'));
-                resolve({ version: m[1], nupkgName });
-            });
-        });
-        req.on('error', reject);
-        req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
-    });
-}
-
-function versionGt(a, b) {
-    const pa = a.split('.').map(Number);
-    const pb = b.split('.').map(Number);
-    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-        const x = pa[i] || 0, y = pb[i] || 0;
-        if (x > y) return true;
-        if (x < y) return false;
-    }
-    return false;
-}
-
-function spawnClaudeUpdate(arg) {
-    const env = Object.assign({}, process.env);
-    const child = spawn('/usr/bin/claude-update', [arg], {
-        detached: true, stdio: 'ignore', env: env, cwd: env.HOME || '/tmp',
-    });
-    child.unref();
-}
-
-function notifyUpdateAvailable(currentVer, latestVer) {
-    if (lastNotifiedVersion === latestVer) return;
-    lastNotifiedVersion = latestVer;
-    if (!Notification.isSupported()) return;
-    const n = new Notification({
-        title: 'Aggiornamento Claude Desktop disponibile',
-        body: `Nuova versione: ${latestVer}\nInstallata: ${currentVer}\nClicca per aggiornare.`,
-    });
-    n.on('click', () => showUpgradeDialog(currentVer, latestVer));
-    n.show();
-}
-
-function showUpgradeDialog(currentVer, latestVer) {
-    const choice = dialog.showMessageBoxSync({
-        type: 'question',
-        title: 'Aggiornamento Claude Desktop',
-        message: `È disponibile la versione ${latestVer}`,
-        detail: `Versione installata: ${currentVer}\n\nL'aggiornamento scaricherà il pacchetto da Anthropic (~200 MB), lo patcherà per Linux e lo installerà sul sistema. Ti verrà chiesta la password di amministratore.\n\nClaude verrà riavviato al termine.`,
-        buttons: ['Aggiorna ora', 'Più tardi'],
-        defaultId: 0, cancelId: 1,
-    });
-    if (choice === 0) spawnClaudeUpdate('--upgrade');
-}
-
-function notifyEndpointError(errorMsg) {
-    if (lastNotifiedVersion === 'ERROR') return;
-    lastNotifiedVersion = 'ERROR';
-    if (!Notification.isSupported()) return;
-    const n = new Notification({
-        title: 'Controllo aggiornamenti Claude fallito',
-        body: 'Anthropic potrebbe aver cambiato il meccanismo di pubblicazione.',
-        silent: true,
-    });
-    n.on('click', () => {
-        const choice = dialog.showMessageBoxSync({
-            type: 'warning', title: 'Controllo aggiornamenti fallito',
-            message: 'Non riesco a contattare l\'endpoint di aggiornamento',
-            detail: `Errore: ${errorMsg}`,
-            buttons: ['Apri diagnostica', 'Ignora'], defaultId: 0, cancelId: 1,
-        });
-        if (choice === 0) spawnClaudeUpdate('--diagnose');
-    });
-    n.show();
-}
-
-async function performCheck() {
-    if (isChecking) return;
-    isChecking = true;
-    try {
-        const installed = getInstalledVersion();
-        const remote = await fetchLatestVersion();
-        lastKnownRemote = remote;
-        lastCheckTime = new Date();
-        if (versionGt(remote.version, installed)) {
-            notifyUpdateAvailable(installed, remote.version);
-        } else {
-            if (lastNotifiedVersion === 'ERROR') lastNotifiedVersion = null;
-        }
-    } catch (err) {
-        log('Check fallito:', err.message);
-        notifyEndpointError(err.message);
-    } finally { isChecking = false; }
-}
-
-async function checkForUpdatesNow() {
-    try {
-        const remote = await fetchLatestVersion();
-        lastKnownRemote = remote;
-        lastCheckTime = new Date();
-        const installed = getInstalledVersion();
-        if (versionGt(remote.version, installed)) {
-            notifyUpdateAvailable(installed, remote.version);
-        } else if (Notification.isSupported()) {
-            new Notification({
-                title: 'Claude Desktop è aggiornato',
-                body: `Hai la versione più recente (${installed}).`, silent: true,
-            }).show();
-        }
-    } catch (err) { notifyEndpointError(err.message); }
-}
-
-async function showVersionInfo() {
-    const installed = getInstalledVersion();
-    const needsFresh = !lastCheckTime || (Date.now() - lastCheckTime.getTime()) > 5 * 60 * 1000;
-    let remote = lastKnownRemote;
-    let checkError = null;
-    if (needsFresh) {
-        try {
-            remote = await fetchLatestVersion();
-            lastKnownRemote = remote;
-            lastCheckTime = new Date();
-        } catch (err) { checkError = err.message; }
-    }
-    if (checkError) {
-        const choice = dialog.showMessageBoxSync({
-            type: 'warning', title: 'Info versione Claude Desktop',
-            message: `Versione installata: ${installed}`,
-            detail: `Impossibile verificare aggiornamenti: ${checkError}`,
-            buttons: ['Apri diagnostica', 'OK'], defaultId: 1, cancelId: 1,
-        });
-        if (choice === 0) spawnClaudeUpdate('--diagnose');
-        return;
-    }
-    if (versionGt(remote.version, installed)) {
-        showUpgradeDialog(installed, remote.version);
-    } else {
-        dialog.showMessageBoxSync({
-            type: 'info', title: 'Info versione Claude Desktop',
-            message: 'Claude Desktop è aggiornato',
-            detail: `Versione installata: ${installed}\nUltima disponibile: ${remote.version}`,
-            buttons: ['OK'],
-        });
-    }
-}
-
-function toggleMainWindow() {
-    try {
-        const ws = BrowserWindow.getAllWindows();
-        if (!ws || ws.length === 0) return;
-        const main = ws.find((w) => w.isVisible()) || ws[0];
-        if (main.isVisible() && main.isFocused()) main.hide();
-        else { if (!main.isVisible()) main.show(); main.focus(); }
-    } catch (e) {}
-}
-
-function handleNewWindowHideUntilMenuRemoved(win) {
-    try {
-        win.hide();
-        if (typeof win.setMenu === 'function') win.setMenu(null);
-        if (typeof win.setMenuBarVisibility === 'function') win.setMenuBarVisibility(false);
-        Menu.setApplicationMenu(null);
-        setInterval(() => {
-            try {
-                Menu.setApplicationMenu(null);
-                BrowserWindow.getAllWindows().forEach((w) => {
-                    try {
-                        if (typeof w.setMenu === 'function') w.setMenu(null);
-                        if (typeof w.setMenuBarVisibility === 'function') w.setMenuBarVisibility(false);
-                    } catch (e) {}
-                });
-            } catch (e) {}
-        }, 200);
-        const showWhenReady = () => {
-            try {
-                Menu.setApplicationMenu(null);
-                if (typeof win.setMenu === 'function') win.setMenu(null);
-                if (typeof win.setMenuBarVisibility === 'function') win.setMenuBarVisibility(false);
-                win.show();
-                win.focus();
-            } catch (e) {}
-        };
-        setTimeout(showWhenReady, 5000);
-    } catch (e) {
-        try { win.show(); } catch (e2) {}
-    }
-}
-
-function setupTrayIcon() {
-    try {
-        const iconCandidates = [
-            '/usr/share/icons/hicolor/256x256/apps/claude.png',
-            '/usr/share/icons/hicolor/128x128/apps/claude.png',
-            '/usr/share/icons/hicolor/64x64/apps/claude.png',
-            '/usr/share/icons/hicolor/48x48/apps/claude.png',
-            '/usr/share/icons/hicolor/32x32/apps/claude.png',
-        ];
-        let iconPath = null;
-        for (const c of iconCandidates) if (fs.existsSync(c)) { iconPath = c; break; }
-        if (!iconPath) return;
-
-        trayInstance = new Tray(iconPath);
-        trayInstance.setToolTip('Claude Desktop');
-
-        const buildMenu = () => Menu.buildFromTemplate([
-            { label: `Claude Desktop v${getInstalledVersion()}`, enabled: false },
-            { type: 'separator' },
-            { label: 'Mostra/Nascondi finestra', click: toggleMainWindow },
-            { type: 'separator' },
-            { label: 'Verifica aggiornamenti', click: () => checkForUpdatesNow() },
-            { label: 'Info versione e aggiornamenti…', click: () => showVersionInfo() },
-            { type: 'separator' },
-            { label: 'Esci', click: () => app.quit() },
-        ]);
-        trayInstance.setContextMenu(buildMenu());
-        trayInstance.on('click', toggleMainWindow);
-    } catch (e) { log('Tray error:', e.message); }
-}
-
-app.whenReady().then(() => {
-    Menu.setApplicationMenu(null);
-    app.on('browser-window-created', (event, win) => {
-        handleNewWindowHideUntilMenuRemoved(win);
-    });
-    BrowserWindow.getAllWindows().forEach((w) => {
-        try {
-            if (typeof w.setMenu === 'function') w.setMenu(null);
-            if (typeof w.setMenuBarVisibility === 'function') w.setMenuBarVisibility(false);
-        } catch (e) {}
-    });
-    setTimeout(setupTrayIcon, 3000);
-    setTimeout(performCheck, FIRST_CHECK_DELAY_MS);
-    setInterval(performCheck, CHECK_INTERVAL_MS);
-});
-UPDATER_JS
-
-    # 4. Frame-fix-entry: include sia frame-fix-wrapper che update-checker
-    cat > "${extracted}/frame-fix-entry.js" <<'ENTRY'
-'use strict';
-require('./frame-fix-wrapper');
-try { require('./update-checker'); }
-catch (e) { console.error('[update-checker] errore caricamento:', e.message); }
+try { require('./frame-fix-wrapper'); } catch (e) {}
+try { require('./update-checker'); } catch (e) {}
 require('./.vite/build/index.js');
 ENTRY
+    fi
 
-    # Aggiorna package.json main
+    # 3. Aggiorna package.json: main → frame-fix-entry.js
     local pkgjson="${extracted}/package.json"
     if [[ -f "${pkgjson}" ]]; then
         node -e "
@@ -2067,7 +1828,7 @@ ENTRY
         " 2>/dev/null || true
     fi
 
-    # 3. Copia i18n dentro l'asar
+    # 4. Copia i file i18n dentro l'asar
     mkdir -p "${extracted}/resources/i18n"
     find "${nupkg_extract}" -name "*-*.json" \
         ! -path "*/node_modules/*" ! -name "package*.json" 2>/dev/null \
@@ -2077,12 +1838,12 @@ ENTRY
     [[ -f "${extracted}/resources/i18n/en-US.json" ]] \
         || echo '{}' > "${extracted}/resources/i18n/en-US.json"
 
-    # 4. Patch Claude Code (CCD) per supporto Linux
-    # La funzione getHostPlatform() upstream non ha un ramo Linux.
-    # Aggiungiamolo (linux-x64 / linux-arm64 sono target validi nel manifest).
+    # 5. Patch Claude Code (CCD) per supporto Linux: aggiunge ramo linux a
+    #    getHostPlatform() in .vite/build/index.js
     local vite_index="${extracted}/.vite/build/index.js"
     if [[ -f "${vite_index}" ]]; then
-        local patch_js="${staging}/patch-ccd.js"
+        local staging_dir="$(dirname "${extracted}")"
+        local patch_js="${staging_dir}/patch-ccd.js"
         cat > "${patch_js}" << 'PATCHCCD'
 'use strict';
 const fs = require('fs');
@@ -2103,8 +1864,17 @@ PATCHCCD
         node "${patch_js}" "${vite_index}" 2>/dev/null || true
     fi
 
+    # 6. Verifica sintassi dei 3 file JS prima del repack (fail-fast)
+    for jsf in frame-fix-wrapper.js frame-fix-entry.js update-checker.js; do
+        if [[ -f "${extracted}/${jsf}" ]]; then
+            node -c "${extracted}/${jsf}" 2>/dev/null \
+                || { echo "[ERROR] Sintassi non valida: ${jsf}" >&2; return 1; }
+        fi
+    done
+
     return 0
 }
+
 
 # ── Modalità --diagnose ───────────────────────────────────────────────────
 # Apre Claude con un prompt precompilato che spiega il problema e fornisce
