@@ -1305,55 +1305,50 @@ try {
     process.exit(1);
 }
 
-// Il pattern cerca la funzione getHostPlatform() nell'index.js minificato.
-// Il testo è: if win32... ;throw new Error(`Unsupported platform:
-// Nota: la stringa viene costruita in modo da contenere backtick letterale.
-const needle =
-    'if(process.platform==="win32")return A==="arm64"?"win32-arm64":"win32-x64";' +
-    'throw new Error(' + String.fromCharCode(96) + 'Unsupported platform:';
+// Pattern resiliente: il nome della variabile minificata cambia ad ogni
+// release di Anthropic (era "A" nelle vecchie versioni, è "e" nella 1.11x).
+// Usiamo una regex con backreference che cattura la lettera della variabile
+// e la riusa nel replacement, indipendentemente da quale lettera sia.
+//
+// Cerchiamo:
+//   if(process.platform==="win32")return <VAR>==="arm64"?"win32-arm64":"win32-x64";
+// dove <VAR> è una singola lettera. Aggiungiamo il ramo linux subito dopo.
+const winRegex = /if\(process\.platform==="win32"\)return\s+([A-Za-z_])==="arm64"\?"win32-arm64":"win32-x64";/g;
 
-const replacement =
-    'if(process.platform==="win32")return A==="arm64"?"win32-arm64":"win32-x64";' +
-    'if(process.platform==="linux")return A==="arm64"?"linux-arm64":"linux-x64";' +
-    'throw new Error(' + String.fromCharCode(96) + 'Unsupported platform:';
-
-// Conta occorrenze
-let count = 0;
-let idx = -1;
-while ((idx = src.indexOf(needle, idx + 1)) !== -1) count++;
-
-if (count === 0) {
-    console.error('[WARN] Pattern getHostPlatform non trovato. Upstream potrebbe essere cambiato.');
-    // Proviamo anche un pattern di fallback più tollerante (senza ";throw")
-    const altNeedle =
-        'if(process.platform==="win32")return A==="arm64"?"win32-arm64":"win32-x64";';
-    const altReplacement =
-        'if(process.platform==="win32")return A==="arm64"?"win32-arm64":"win32-x64";' +
-        'if(process.platform==="linux")return A==="arm64"?"linux-arm64":"linux-x64";';
-
-    let altCount = 0;
-    let i = -1;
-    while ((i = src.indexOf(altNeedle, i + 1)) !== -1) altCount++;
-
-    if (altCount === 0) {
-        console.error('[WARN] Anche il pattern di fallback non trovato. Nessuna patch applicata.');
-        process.exit(0);
-    }
-    console.log('[INFO] Uso pattern di fallback (' + altCount + ' occorrenze)');
-    src = src.split(altNeedle).join(altReplacement);
-} else {
-    src = src.split(needle).join(replacement);
-    console.log('[OK] Patch getHostPlatform applicata (' + count + ' occorrenze)');
+// Check idempotenza: se nel file il ramo linux è già presente almeno tante
+// volte quante il ramo win32, non rifare la patch (siamo già patchati).
+const winCount = (src.match(/if\(process\.platform==="win32"\)return\s+[A-Za-z_]==="arm64"\?"win32-arm64":"win32-x64";/g) || []).length;
+const linuxCount = (src.match(/if\(process\.platform==="linux"\)return\s+[A-Za-z_]==="arm64"\?"linux-arm64":"linux-x64";/g) || []).length;
+if (winCount > 0 && linuxCount >= winCount) {
+    console.log('[OK] Già patchato (' + linuxCount + ' rami linux presenti, ' + winCount + ' win32)');
+    process.exit(0);
 }
 
-fs.writeFileSync(path, src, 'utf8');
+let count = 0;
+let lastVar = null;
+const newSrc = src.replace(winRegex, (match, varName) => {
+    count++;
+    lastVar = varName;
+    return match +
+        'if(process.platform==="linux")return ' + varName +
+        '==="arm64"?"linux-arm64":"linux-x64";';
+});
+
+if (count === 0) {
+    console.error('[WARN] Pattern getHostPlatform win32 non trovato. Upstream potrebbe essere cambiato in modo significativo.');
+    process.exit(0);
+}
+
+fs.writeFileSync(path, newSrc, 'utf8');
+console.log('[OK] Patch getHostPlatform applicata (' + count + ' occorrenze, var=' + lastVar + ')');
 console.log('[OK] File salvato: ' + path);
 PATCHJS
     node "${PATCH_SCRIPT}" "${VITE_INDEX}" \
         || warn "Patch Code/CCD fallita (non bloccante)"
 
     # Verifica post-patch: cerchiamo process.platform==="linux" nel file
-    if grep -q 'process\.platform==="linux")return A==="arm64"' "${VITE_INDEX}"; then
+    # (con qualunque nome di variabile)
+    if grep -qE 'if\(process\.platform==="linux"\)return [A-Za-z_]==="arm64"\?"linux-arm64":"linux-x64"' "${VITE_INDEX}"; then
         ok "Patch Code/CCD verificata: ramo linux presente in index.js"
     else
         warn "Patch Code/CCD non verificata: ramo linux non trovato dopo la patch"
@@ -1838,8 +1833,10 @@ ENTRY
     [[ -f "${extracted}/resources/i18n/en-US.json" ]] \
         || echo '{}' > "${extracted}/resources/i18n/en-US.json"
 
-    # 5. Patch Claude Code (CCD) per supporto Linux: aggiunge ramo linux a
-    #    getHostPlatform() in .vite/build/index.js
+    # 5. Patch Claude Code (CCD) per supporto Linux.
+    # Pattern regex-based per resistere a rename di variabili minificate
+    # (es. "A" → "e" tra versioni). Cattura la lettera della variabile
+    # via backreference e la riusa nel replacement.
     local vite_index="${extracted}/.vite/build/index.js"
     if [[ -f "${vite_index}" ]]; then
         local staging_dir="$(dirname "${extracted}")"
@@ -1851,14 +1848,28 @@ const p = process.argv[2];
 if (!p) process.exit(1);
 let s;
 try { s = fs.readFileSync(p, 'utf8'); } catch (e) { process.exit(1); }
-const needle =
-    'if(process.platform==="win32")return A==="arm64"?"win32-arm64":"win32-x64";';
-const repl =
-    'if(process.platform==="win32")return A==="arm64"?"win32-arm64":"win32-x64";' +
-    'if(process.platform==="linux")return A==="arm64"?"linux-arm64":"linux-x64";';
-if (s.includes(needle) && !s.includes('if(process.platform==="linux")return A==="arm64"?"linux-arm64"')) {
-    s = s.split(needle).join(repl);
-    fs.writeFileSync(p, s, 'utf8');
+const winRegex = /if\(process\.platform==="win32"\)return\s+([A-Za-z_])==="arm64"\?"win32-arm64":"win32-x64";/g;
+let count = 0;
+let lastVar = null;
+const out = s.replace(winRegex, (match, varName) => {
+    count++;
+    lastVar = varName;
+    // Idempotenza: se la riga linux è già dopo questo match, non aggiungiamo
+    return match +
+        'if(process.platform==="linux")return ' + varName +
+        '==="arm64"?"linux-arm64":"linux-x64";';
+});
+if (count > 0) {
+    // Verifica grossolana di idempotenza: se nel file originale c'erano già
+    // tante linee linux quante win32, non sovrascrivere (potremmo aggiungere
+    // ramo duplicato in caso di doppia esecuzione)
+    const winCount = (s.match(/if\(process\.platform==="win32"\)return\s+[A-Za-z_]==="arm64"\?"win32-arm64":"win32-x64";/g) || []).length;
+    const linuxAlreadyCount = (s.match(/if\(process\.platform==="linux"\)return\s+[A-Za-z_]==="arm64"\?"linux-arm64":"linux-x64";/g) || []).length;
+    if (linuxAlreadyCount >= winCount) {
+        // Già patchato, niente da fare
+        process.exit(0);
+    }
+    fs.writeFileSync(p, out, 'utf8');
 }
 PATCHCCD
         node "${patch_js}" "${vite_index}" 2>/dev/null || true
