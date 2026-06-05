@@ -315,26 +315,33 @@ const path = process.argv[2];
 if (!path) process.exit(1);
 let src;
 try { src = fs.readFileSync(path, 'utf8'); } catch (e) { process.exit(1); }
-const needle = 'if(process.platform==="win32")return A==="arm64"?"win32-arm64":"win32-x64";' +
-               'throw new Error(' + String.fromCharCode(96) + 'Unsupported platform:';
-const replacement = 'if(process.platform==="win32")return A==="arm64"?"win32-arm64":"win32-x64";' +
-                    'if(process.platform==="linux")return A==="arm64"?"linux-arm64":"linux-x64";' +
-                    'throw new Error(' + String.fromCharCode(96) + 'Unsupported platform:';
-let count = 0; let idx = -1;
-while ((idx = src.indexOf(needle, idx + 1)) !== -1) count++;
-if (count === 0) {
-    const altN = 'if(process.platform==="win32")return A==="arm64"?"win32-arm64":"win32-x64";';
-    const altR = altN + 'if(process.platform==="linux")return A==="arm64"?"linux-arm64":"linux-x64";';
-    let altCount = 0; let i = -1;
-    while ((i = src.indexOf(altN, i + 1)) !== -1) altCount++;
-    if (altCount === 0) { console.error('[WARN] Pattern non trovato'); process.exit(0); }
-    src = src.split(altN).join(altR);
-    console.log('[INFO] Pattern fallback (' + altCount + ')');
-} else {
-    src = src.split(needle).join(replacement);
-    console.log('[OK] Patch CCD applicata (' + count + ')');
+// Pattern regex-based: resiste a rename di variabili minificate.
+// Cattura la lettera della variabile via backreference e la riusa.
+const winRegex = /if\(process\.platform==="win32"\)return\s+([A-Za-z_])==="arm64"\?"win32-arm64":"win32-x64";/g;
+
+// Check idempotenza
+const winCount = (src.match(/if\(process\.platform==="win32"\)return\s+[A-Za-z_]==="arm64"\?"win32-arm64":"win32-x64";/g) || []).length;
+const linuxCount = (src.match(/if\(process\.platform==="linux"\)return\s+[A-Za-z_]==="arm64"\?"linux-arm64":"linux-x64";/g) || []).length;
+if (winCount > 0 && linuxCount >= winCount) {
+    console.log('[OK] Già patchato');
+    process.exit(0);
 }
-fs.writeFileSync(path, src, 'utf8');
+
+let count = 0;
+let lastVar = null;
+const newSrc = src.replace(winRegex, (match, varName) => {
+    count++;
+    lastVar = varName;
+    return match +
+        'if(process.platform==="linux")return ' + varName +
+        '==="arm64"?"linux-arm64":"linux-x64";';
+});
+if (count === 0) {
+    console.error('[WARN] Pattern getHostPlatform win32 non trovato.');
+    process.exit(0);
+}
+fs.writeFileSync(path, newSrc, 'utf8');
+console.log('[OK] Patch CCD applicata (' + count + ' occorrenze, var=' + lastVar + ')');
 PATCHJS
     node "${PATCH_SCRIPT}" "${VITE_INDEX}" || warn "Patch CCD fallita"
 fi
@@ -1021,7 +1028,8 @@ ENTRY
     [[ -f "${extracted}/resources/i18n/en-US.json" ]] \
         || echo '{}' > "${extracted}/resources/i18n/en-US.json"
 
-    # 5. Patch Claude Code (CCD) per supporto Linux
+    # 5. Patch Claude Code (CCD) per supporto Linux.
+    # Pattern regex-based per resistere a rename di variabili minificate.
     local vite_index="${extracted}/.vite/build/index.js"
     if [[ -f "${vite_index}" ]]; then
         local staging_dir="$(dirname "${extracted}")"
@@ -1033,14 +1041,21 @@ const p = process.argv[2];
 if (!p) process.exit(1);
 let s;
 try { s = fs.readFileSync(p, 'utf8'); } catch (e) { process.exit(1); }
-const needle =
-    'if(process.platform==="win32")return A==="arm64"?"win32-arm64":"win32-x64";';
-const repl =
-    'if(process.platform==="win32")return A==="arm64"?"win32-arm64":"win32-x64";' +
-    'if(process.platform==="linux")return A==="arm64"?"linux-arm64":"linux-x64";';
-if (s.includes(needle) && !s.includes('if(process.platform==="linux")return A==="arm64"?"linux-arm64"')) {
-    s = s.split(needle).join(repl);
-    fs.writeFileSync(p, s, 'utf8');
+const winRegex = /if\(process\.platform==="win32"\)return\s+([A-Za-z_])==="arm64"\?"win32-arm64":"win32-x64";/g;
+let count = 0;
+let lastVar = null;
+const out = s.replace(winRegex, (match, varName) => {
+    count++;
+    lastVar = varName;
+    return match +
+        'if(process.platform==="linux")return ' + varName +
+        '==="arm64"?"linux-arm64":"linux-x64";';
+});
+if (count > 0) {
+    const winCount = (s.match(/if\(process\.platform==="win32"\)return\s+[A-Za-z_]==="arm64"\?"win32-arm64":"win32-x64";/g) || []).length;
+    const linuxAlreadyCount = (s.match(/if\(process\.platform==="linux"\)return\s+[A-Za-z_]==="arm64"\?"linux-arm64":"linux-x64";/g) || []).length;
+    if (linuxAlreadyCount >= winCount) process.exit(0);
+    fs.writeFileSync(p, out, 'utf8');
 }
 PATCHCCD
         node "${patch_js}" "${vite_index}" 2>/dev/null || true
@@ -1053,12 +1068,6 @@ PATCHCCD
                 || { echo "[ERROR] Sintassi non valida: ${jsf}" >&2; return 1; }
         fi
     done
-
-    return 0
-}
-PATCHCCD
-        node "${patch_js}" "${vite_index}" 2>/dev/null || true
-    fi
 
     return 0
 }
