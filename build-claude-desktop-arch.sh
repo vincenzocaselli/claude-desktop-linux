@@ -179,9 +179,10 @@ cat > "${NATIVE_DIR}/package.json" << 'PKG'
 PKG
 cat > "${NATIVE_DIR}/index.js" << 'STUB'
 'use strict';
-const KeyboardKey={A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7,I:8,J:9,K:10,L:11,M:12,N:13,O:14,P:15,Q:16,R:17,S:18,T:19,U:20,V:21,W:22,X:23,Y:24,Z:25,N0:26,N1:27,N2:28,N3:29,N4:30,N5:31,N6:32,N7:33,N8:34,N9:35,F1:36,F2:37,F3:38,F4:39,F5:40,F6:41,F7:42,F8:43,F9:44,F10:45,F11:46,F12:47,Space:48,Enter:49,Tab:50,Backspace:51,Delete:52,Escape:53,Home:54,End:55,PageUp:56,PageDown:57,ArrowLeft:58,ArrowRight:59,ArrowUp:60,ArrowDown:61,Shift:62,Control:63,Alt:64,Meta:65};
-const AuthRequest={isAvailable:()=>false,start:(_u,cb)=>cb&&cb(null,new Error('N/A Linux')),cancel:()=>{}};
-module.exports={KeyboardKey,AuthRequest,getWindowsWithSameApp:()=>[],getMonitorList:()=>[],getMouseLocation:()=>({x:0,y:0}),getTotalMemory:()=>4*1024*1024*1024,getWindowTitle:()=>'',moveMouseTo:()=>{},simulateKey:()=>{},screenCapture:()=>null,setGlobalShortcut:()=>true,unsetGlobalShortcut:()=>{},getSystemTheme:()=>'dark',onWindowFocusChanged:()=>{},getResourcesPath:()=>'/usr/lib/claude-desktop'};
+const KeyboardKey={A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7,I:8,J:9,K:10,L:11,M:12,N:13,O:14,P:15,Q:16,R:17,S:18,T:19,U:20,V:21,W:22,X:23,Y:24,Z:25};
+const AuthRequest={isAvailable:()=>false,start:(_u,cb)=>cb&&cb(null,new Error('N/A')),cancel:()=>{}};
+const _base={KeyboardKey,AuthRequest,getWindowsWithSameApp:()=>[],getMonitorList:()=>[],getMouseLocation:()=>({x:0,y:0}),getTotalMemory:()=>4*1024*1024*1024,getWindowTitle:()=>'',moveMouseTo:()=>{},simulateKey:()=>{},screenCapture:()=>null,setGlobalShortcut:()=>true,unsetGlobalShortcut:()=>{},getSystemTheme:()=>'dark',onWindowFocusChanged:()=>{},getResourcesPath:()=>'/usr/lib/claude-desktop'};
+module.exports=new Proxy(_base,{get(t,p){if(p in t)return t[p];if(typeof p==='symbol')return undefined;return function(){const n=String(p);if(n.startsWith('is')||n.startsWith('has')||n.startsWith('can'))return false;if(n.startsWith('read')||n.startsWith('get')||n.startsWith('list')||n.startsWith('enum')||n.startsWith('find'))return [];return undefined;};}});
 STUB
 
 # ── Frame fix wrapper ──────────────────────────────────────────────────────
@@ -987,7 +988,8 @@ PKG
 'use strict';
 const KeyboardKey={A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7,I:8,J:9,K:10,L:11,M:12,N:13,O:14,P:15,Q:16,R:17,S:18,T:19,U:20,V:21,W:22,X:23,Y:24,Z:25};
 const AuthRequest={isAvailable:()=>false,start:(_u,cb)=>cb&&cb(null,new Error('N/A')),cancel:()=>{}};
-module.exports={KeyboardKey,AuthRequest,getWindowsWithSameApp:()=>[],getMonitorList:()=>[],getMouseLocation:()=>({x:0,y:0}),getTotalMemory:()=>4*1024*1024*1024,getWindowTitle:()=>'',moveMouseTo:()=>{},simulateKey:()=>{},screenCapture:()=>null,setGlobalShortcut:()=>true,unsetGlobalShortcut:()=>{},getSystemTheme:()=>'dark',onWindowFocusChanged:()=>{},getResourcesPath:()=>'/usr/lib/claude-desktop'};
+const _base={KeyboardKey,AuthRequest,getWindowsWithSameApp:()=>[],getMonitorList:()=>[],getMouseLocation:()=>({x:0,y:0}),getTotalMemory:()=>4*1024*1024*1024,getWindowTitle:()=>'',moveMouseTo:()=>{},simulateKey:()=>{},screenCapture:()=>null,setGlobalShortcut:()=>true,unsetGlobalShortcut:()=>{},getSystemTheme:()=>'dark',onWindowFocusChanged:()=>{},getResourcesPath:()=>'/usr/lib/claude-desktop'};
+module.exports=new Proxy(_base,{get(t,p){if(p in t)return t[p];if(typeof p==='symbol')return undefined;return function(){const n=String(p);if(n.startsWith('is')||n.startsWith('has')||n.startsWith('can'))return false;if(n.startsWith('read')||n.startsWith('get')||n.startsWith('list')||n.startsWith('enum')||n.startsWith('find'))return [];return undefined;};}});
 STUB
 
     # 2. File patch da /usr/lib/claude-desktop/patches (installati dal pacchetto)
