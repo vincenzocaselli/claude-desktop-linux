@@ -292,6 +292,31 @@ Module._load = function(request, parent, isMain) {
         applyVisibilityFixes(win);
         win.on('show', () => applyVisibilityFixes(win));
         win.on('ready-to-show', () => applyVisibilityFixes(win));
+
+        // Nascondi le finestre "secondary vuote" 800x600 senza URL/titolo
+        const checkAndHideEmpty = () => {
+          try {
+            const wc = win.webContents;
+            const url = wc && wc.getURL ? wc.getURL() : '';
+            const title = win.getTitle ? win.getTitle() : '';
+            const b = win.getBounds ? win.getBounds() : { width: 0, height: 0 };
+            const isEmpty = (!url || url === 'about:blank') &&
+                            (!title || title === 'Claude');
+            const isDefault = b.width === 800 && b.height === 600;
+            if (isEmpty && isDefault) {
+              try { win.hide(); } catch (e) {}
+              win.on('show', () => {
+                try {
+                  const u = win.webContents ? win.webContents.getURL() : '';
+                  if (!u || u === 'about:blank') win.hide();
+                } catch (e) {}
+              });
+            }
+          } catch (e) {}
+        };
+        checkAndHideEmpty();
+        setTimeout(checkAndHideEmpty, 500);
+        setTimeout(checkAndHideEmpty, 2000);
       });
     }
     try {
