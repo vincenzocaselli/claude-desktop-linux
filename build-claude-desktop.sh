@@ -679,6 +679,45 @@ Module._load = function(request, parent, isMain) {
         applyVisibilityFixes(win, 'event:browser-window-created');
         win.on('show', () => applyVisibilityFixes(win, 'event:show'));
         win.on('ready-to-show', () => applyVisibilityFixes(win, 'event:ready-to-show'));
+
+        // Heuristic per identificare le finestre "secondary vuote" che
+        // Anthropic crea all'avvio (probabilmente pre-warm Cowork/Dispatch).
+        // Su Linux appaiono come riquadri bianchi 800x600 vuoti.
+        // Distinguiamo confrontando con la finestra principale:
+        //  - URL about:blank (o vuoto) = secondary
+        //  - Titolo vuoto E dimensioni 800x600 esatte = secondary
+        // Le nascondiamo permanentemente, lasciando visibile solo quella
+        // principale che carica claude.ai/...
+        const checkAndHideEmptyWindow = () => {
+          try {
+            const wc = win.webContents;
+            if (!wc) return;
+            const url = wc.getURL ? wc.getURL() : '';
+            const title = win.getTitle ? win.getTitle() : '';
+            const bounds = win.getBounds ? win.getBounds() : { width: 0, height: 0 };
+            const isEmpty = (!url || url === 'about:blank' || url === '') &&
+                            (!title || title === '' || title === 'Claude');
+            const isDefaultSize = bounds.width === 800 && bounds.height === 600;
+            // Considera "secondary" se ha URL vuoto e dimensioni default
+            if (isEmpty && isDefaultSize) {
+              console.log('[frame-fix] finestra secondary individuata: url=' +
+                          JSON.stringify(url) + ' size=' + bounds.width + 'x' + bounds.height +
+                          ' -> nascosta');
+              try { win.hide(); } catch (e) {}
+              // Re-hide se l'app prova a re-mostrarla
+              win.on('show', () => {
+                try {
+                  const u = win.webContents ? win.webContents.getURL() : '';
+                  if (!u || u === 'about:blank' || u === '') win.hide();
+                } catch (e) {}
+              });
+            }
+          } catch (e) {}
+        };
+        // Controlla subito e dopo 2 secondi (l'URL viene caricato dopo create)
+        checkAndHideEmptyWindow();
+        setTimeout(checkAndHideEmptyWindow, 500);
+        setTimeout(checkAndHideEmptyWindow, 2000);
       });
       console.log('[frame-fix] listener browser-window-created agganciato');
 
