@@ -762,6 +762,32 @@ cp "${WORKDIR}/patches/update-checker.js"    \
    "${PKGDIR}/usr/lib/claude-desktop/patches/"
 ok "Patch files installati in /usr/lib/claude-desktop/patches/"
 
+# Script helper per pkexec (dialog autenticazione leggibile)
+cat > "${PKGDIR}/usr/lib/claude-desktop/claude-apply-update" << 'APPLYUPDATE'
+#!/usr/bin/env bash
+# claude-apply-update — Applica un aggiornamento di Claude Desktop (root via pkexec)
+# Uso: claude-apply-update <asar_sorgente> <dir_resources> <versione>
+set -euo pipefail
+ASAR_SRC="${1:-}"
+RESOURCES_DIR="${2:-}"
+NEW_VERSION="${3:-}"
+TARGET="/usr/lib/claude-desktop"
+if [[ -z "${ASAR_SRC}" || -z "${NEW_VERSION}" ]]; then
+    echo "Uso: claude-apply-update <asar_sorgente> <dir_resources> <versione>" >&2
+    exit 1
+fi
+[[ -f "${ASAR_SRC}" ]] || { echo "asar sorgente non trovato: ${ASAR_SRC}" >&2; exit 1; }
+cp "${ASAR_SRC}" "${TARGET}/app.asar"
+if [[ -n "${RESOURCES_DIR}" && -d "${RESOURCES_DIR}" ]]; then
+    rm -rf "${TARGET}/resources"
+    cp -r "${RESOURCES_DIR}" "${TARGET}/resources"
+fi
+printf '%s\n' "${NEW_VERSION}" > "${TARGET}/.installed-version"
+echo "Claude Desktop aggiornato alla versione ${NEW_VERSION}"
+APPLYUPDATE
+chmod 755 "${PKGDIR}/usr/lib/claude-desktop/claude-apply-update"
+ok "Script claude-apply-update installato"
+
 # Electron dist
 mkdir -p "${PKGDIR}/usr/lib/claude-desktop/electron-dist"
 cp -r "${ELECTRON_DIST}"/* "${PKGDIR}/usr/lib/claude-desktop/electron-dist/"
@@ -963,27 +989,44 @@ do_inplace_upgrade() {
     local resources_src="${staging}/extract"
     local resources_dir
     resources_dir=$(find "${resources_src}" -type d -name "resources" | head -1)
+    local apply_script="${target}/claude-apply-update"
 
-    if command -v pkexec >/dev/null 2>&1; then
-        pkexec bash -c "
-            cp '${staging}/app-patched.asar' '${target}/app.asar' && \
-            if [[ -d '${resources_dir}' ]]; then
-                rm -rf '${target}/resources'
-                cp -r '${resources_dir}' '${target}/resources'
-            fi && \
-            printf '%s\n' '${new_version}' > '${target}/.installed-version'
-        " || return 1
+    if [[ -x "${apply_script}" ]]; then
+        if command -v pkexec >/dev/null 2>&1; then
+            pkexec "${apply_script}" \
+                "${staging}/app-patched.asar" \
+                "${resources_dir}" \
+                "${new_version}" || return 1
+        else
+            local pw
+            pw=$(zenity --password --title="Autenticazione richiesta - Claude Desktop" 2>/dev/null) || return 1
+            echo "${pw}" | sudo -S "${apply_script}" \
+                "${staging}/app-patched.asar" \
+                "${resources_dir}" \
+                "${new_version}" || return 1
+        fi
     else
-        local pw
-        pw=$(zenity --password --title="Autenticazione richiesta" 2>/dev/null) || return 1
-        echo "${pw}" | sudo -S bash -c "
-            cp '${staging}/app-patched.asar' '${target}/app.asar' && \
-            if [[ -d '${resources_dir}' ]]; then
-                rm -rf '${target}/resources'
-                cp -r '${resources_dir}' '${target}/resources'
-            fi && \
-            printf '%s\n' '${new_version}' > '${target}/.installed-version'
-        " || return 1
+        if command -v pkexec >/dev/null 2>&1; then
+            pkexec bash -c "
+                cp '${staging}/app-patched.asar' '${target}/app.asar' && \
+                if [[ -d '${resources_dir}' ]]; then
+                    rm -rf '${target}/resources'
+                    cp -r '${resources_dir}' '${target}/resources'
+                fi && \
+                printf '%s\n' '${new_version}' > '${target}/.installed-version'
+            " || return 1
+        else
+            local pw
+            pw=$(zenity --password --title="Autenticazione richiesta" 2>/dev/null) || return 1
+            echo "${pw}" | sudo -S bash -c "
+                cp '${staging}/app-patched.asar' '${target}/app.asar' && \
+                if [[ -d '${resources_dir}' ]]; then
+                    rm -rf '${target}/resources'
+                    cp -r '${resources_dir}' '${target}/resources'
+                fi && \
+                printf '%s\n' '${new_version}' > '${target}/.installed-version'
+            " || return 1
+        fi
     fi
 
     rm -rf "${staging}"
