@@ -1489,6 +1489,54 @@ cp "${WORKDIR}/patches/update-checker.js"    \
    "${DEBROOT}/usr/lib/claude-desktop/patches/"
 ok "Patch files installati in /usr/lib/claude-desktop/patches/"
 
+# Script helper invocato da pkexec durante l'upgrade. Avere uno script con
+# un nome esplicito rende la dialog di autenticazione PolicyKit molto più
+# chiara: mostra "Authentication is needed to run
+# /usr/lib/claude-desktop/claude-apply-update" invece del comando grezzo
+# "bash -c cp ...". Riceve 3 argomenti: asar sorgente, dir resources, versione.
+cat > "${DEBROOT}/usr/lib/claude-desktop/claude-apply-update" << 'APPLYUPDATE'
+#!/usr/bin/env bash
+# =============================================================================
+# claude-apply-update — Applica un aggiornamento di Claude Desktop
+#
+# Eseguito con privilegi di root (via pkexec) da claude-update --upgrade.
+# Sostituisce app.asar, aggiorna le resources e scrive la versione installata
+# in modo atomico. Avere questo script come file separato (invece di un
+# 'bash -c' inline) rende la richiesta di autenticazione leggibile all'utente.
+#
+# Uso: claude-apply-update <asar_sorgente> <dir_resources> <versione>
+# =============================================================================
+set -euo pipefail
+
+ASAR_SRC="${1:-}"
+RESOURCES_DIR="${2:-}"
+NEW_VERSION="${3:-}"
+TARGET="/usr/lib/claude-desktop"
+
+if [[ -z "${ASAR_SRC}" || -z "${NEW_VERSION}" ]]; then
+    echo "Uso: claude-apply-update <asar_sorgente> <dir_resources> <versione>" >&2
+    exit 1
+fi
+
+[[ -f "${ASAR_SRC}" ]] || { echo "asar sorgente non trovato: ${ASAR_SRC}" >&2; exit 1; }
+
+# Copia atomica dell'asar
+cp "${ASAR_SRC}" "${TARGET}/app.asar"
+
+# Aggiorna resources se forniti
+if [[ -n "${RESOURCES_DIR}" && -d "${RESOURCES_DIR}" ]]; then
+    rm -rf "${TARGET}/resources"
+    cp -r "${RESOURCES_DIR}" "${TARGET}/resources"
+fi
+
+# Scrivi versione installata (fonte di verità per update-checker)
+printf '%s\n' "${NEW_VERSION}" > "${TARGET}/.installed-version"
+
+echo "Claude Desktop aggiornato alla versione ${NEW_VERSION}"
+APPLYUPDATE
+chmod 755 "${DEBROOT}/usr/lib/claude-desktop/claude-apply-update"
+ok "Script claude-apply-update installato"
+
 # Copia resources/ (i18n e altri asset): Electron li cerca nella stessa
 # directory di app.asar, quindi devono stare in /usr/lib/claude-desktop/resources/
 if [[ -d "${WORKDIR}/resources" ]]; then
@@ -1791,35 +1839,54 @@ do_inplace_upgrade() {
     "${asar_tool}" pack "${extracted}" "${staging}/app-patched.asar" || return 1
 
     # Copia in /usr/lib/claude-desktop (richiede privilegi).
-    # Aggiorniamo anche .installed-version: è il file letto dall'update-checker
-    # in-app per sapere qual è la versione corrente. Senza questo, l'app
-    # continuerebbe a vedere la vecchia versione e notificare ogni ora.
+    # Usiamo lo script /usr/lib/claude-desktop/claude-apply-update così la
+    # dialog di autenticazione PolicyKit mostra un nome parlante invece del
+    # comando grezzo "bash -c cp ...". Lo script fa: copia asar, copia
+    # resources, aggiorna .installed-version (tutto in transazione atomica).
     local target="/usr/lib/claude-desktop"
     local resources_src="${staging}/extract"
     local resources_dir
     resources_dir=$(find "${resources_src}" -type d -name "resources" | head -1)
+    local apply_script="${target}/claude-apply-update"
 
-    if command -v pkexec >/dev/null 2>&1; then
-        pkexec bash -c "
-            cp '${staging}/app-patched.asar' '${target}/app.asar' && \
-            if [[ -d '${resources_dir}' ]]; then
-                rm -rf '${target}/resources'
-                cp -r '${resources_dir}' '${target}/resources'
-            fi && \
-            printf '%s\n' '${new_version}' > '${target}/.installed-version'
-        " || return 1
+    if [[ -x "${apply_script}" ]]; then
+        # Script helper presente (pacchetto post-refactoring)
+        if command -v pkexec >/dev/null 2>&1; then
+            pkexec "${apply_script}" \
+                "${staging}/app-patched.asar" \
+                "${resources_dir}" \
+                "${new_version}" || return 1
+        else
+            local pw
+            pw=$(zenity --password --title="Autenticazione richiesta - Claude Desktop" 2>/dev/null) || return 1
+            echo "${pw}" | sudo -S "${apply_script}" \
+                "${staging}/app-patched.asar" \
+                "${resources_dir}" \
+                "${new_version}" || return 1
+        fi
     else
-        # Fallback: chiedi sudo via zenity
-        local pw
-        pw=$(zenity --password --title="Autenticazione richiesta" 2>/dev/null) || return 1
-        echo "${pw}" | sudo -S bash -c "
-            cp '${staging}/app-patched.asar' '${target}/app.asar' && \
-            if [[ -d '${resources_dir}' ]]; then
-                rm -rf '${target}/resources'
-                cp -r '${resources_dir}' '${target}/resources'
-            fi && \
-            printf '%s\n' '${new_version}' > '${target}/.installed-version'
-        " || return 1
+        # Fallback per pacchetti vecchi senza lo script helper
+        if command -v pkexec >/dev/null 2>&1; then
+            pkexec bash -c "
+                cp '${staging}/app-patched.asar' '${target}/app.asar' && \
+                if [[ -d '${resources_dir}' ]]; then
+                    rm -rf '${target}/resources'
+                    cp -r '${resources_dir}' '${target}/resources'
+                fi && \
+                printf '%s\n' '${new_version}' > '${target}/.installed-version'
+            " || return 1
+        else
+            local pw
+            pw=$(zenity --password --title="Autenticazione richiesta" 2>/dev/null) || return 1
+            echo "${pw}" | sudo -S bash -c "
+                cp '${staging}/app-patched.asar' '${target}/app.asar' && \
+                if [[ -d '${resources_dir}' ]]; then
+                    rm -rf '${target}/resources'
+                    cp -r '${resources_dir}' '${target}/resources'
+                fi && \
+                printf '%s\n' '${new_version}' > '${target}/.installed-version'
+            " || return 1
+        fi
     fi
 
     rm -rf "${staging}"
